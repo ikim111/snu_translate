@@ -180,7 +180,13 @@ the same number of items, in the same order, one translation per input segment.
 
 Rules — follow all of them strictly:
 1. Translate EVERY sentence completely. Never summarize, shorten, merge, or skip anything,
-   including direct quotations, examples, and parenthetical remarks.
+   including direct quotations, examples, repeated explanations and parenthetical remarks.
+   Keep logical connectives (즉, 그러나, 반면, 예를 들어, 따라서 …) and the exact strength of every claim:
+   hedges such as may/might/suggest/speculate/not necessarily must stay hedged (가능하다, 시사한다,
+   추측한다, 반드시 그렇지는 않다) — never turn a conjecture into a firm conclusion.
+   Do not add explanations or conclusions that are not in the source. If a short note is truly needed,
+   mark it clearly as "(옮긴이 주: …)". Do not correct apparent errors in the source; translate as written.
+   Keep distinct concepts distinct (e.g. sample distribution 표본분포 vs sampling distribution 표집분포).
 2. Keep the HTML tags <i>, </i>, <b>, </b>, <u>, </u>, <sup>, </sup> and wrap the corresponding translated
    words with them. Keep every <span translate="no">...</span> exactly as it is, untranslated.
 3. Keep author names in their original spelling, years, statistics such as p < .05,
@@ -208,11 +214,14 @@ Rules — follow all of them strictly:
      (Teacher → 교사, Interviewer/I → 면담자, Student/S → 학생, Researcher → 연구자), keep personal
      names as they are (Anna → Anna), and translate the speech in natural spoken Korean
      (교사는 해요체, 학생은 자연스러운 구어체), not in 평서체. Keep bracketed stage notes in brackets.
+     Students' words are research data: keep their mistakes, hesitations (um, uh → 음, 어), false starts,
+     repetitions and interruptions (…, —) exactly; do not tidy them up.
+   - Keep speaker labels' numbering, case numbers and essay codes such as [2P.12] or (WwDC, Case 3) as they are.
    - Table cells: translate concisely; keep numbers, units and names unchanged.
    - Author names, journal names and affiliations stay in their original language."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-06c"
+PROMPT_VERSION = "2026-10-06d"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:

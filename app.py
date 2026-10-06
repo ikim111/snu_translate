@@ -565,9 +565,13 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
     out = pymupdf.open()
     txt: list[str] = []
     md: list[str] = [f"# {Path(uploaded.name).stem}\n"]
-    for pg in (sel if page_list is None else page_list):
+    plist = sel if page_list is None else page_list
+    tpgs = {pg["page_number"]: translated_page(pg) for pg in plist}
+    # 용어집 용어는 처음 나오는 곳에 영어 병기
+    core.annotate_first_terms([t for t in tpgs.values() if t is not None], glossary_entries)
+    for pg in plist:
         pno = pg["page_number"]
-        tpg = translated_page(pg)
+        tpg = tpgs[pno]
         if interleave:
             out.insert_pdf(src, from_page=pno - 1, to_page=pno - 1)
         if tpg is not None:

@@ -25,6 +25,7 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
 """
 from __future__ import annotations
 
+import os
 import re
 import statistics
 from pathlib import Path
@@ -205,13 +206,200 @@ def join_lines(lines: list[dict]) -> tuple[str, str]:
     return html, plain
 
 
+def _page_is_image_backed(page: pymupdf.Page) -> bool:
+    """쪽 전체가 한 장의 이미지인지 (스캔본 + OCR 글자층 PDF)."""
+    area = page.rect.width * page.rect.height
+    try:
+        for img in page.get_images(full=True):
+            for r in page.get_image_rects(img[0]):
+                r = r & page.rect
+                if r.width * r.height > area * 0.8:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _ink_figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
+    """스캔 쪽에서 그림 찾기: 글자가 없는 곳에 잉크가 뭉쳐 있으면 그림(그래프·화면 캡처 등).
+    OCR 글자층의 줄 위치를 지우고 남은 잉크를 6pt 칸으로 묶어 이어진 덩어리를 찾는다."""
+    import numpy as np
+
+    dpi = 36
+    k = 72 / dpi                                        # 1px = 2pt
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, : pix.width]
+    ink = a < 150
+    # 글자 줄을 '전부' 지운 잉크: 진짜 그림은 글자 밖에도 선·점·면이 남고, 표나 OCR이 엉킨 글은 거의 안 남는다
+    heights = sorted(pymupdf.Rect(l["bbox"]).height for b in raw["blocks"] for l in b.get("lines", []))
+    line_h = heights[len(heights) // 2] if heights else 10
+
+    def bogus(l: dict) -> bool:
+        return pymupdf.Rect(l["bbox"]).height > line_h * 2.2
+
+    resid = ink.copy()
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            if bogus(l):
+                continue
+            r = pymupdf.Rect(l["bbox"])
+            resid[max(0, int((r.y0 - 2) / k)):int((r.y1 + 2) / k) + 1,
+                  max(0, int((r.x0 - 2) / k)):int((r.x1 + 2) / k) + 1] = False
+    for b in raw["blocks"]:                             # 글자 줄은 지운다 (조금 넓게)
+        for l in b.get("lines", []):
+            # 그림 속 눈금 숫자나 OCR이 그림을 잘못 읽은 짧은 조각은 지우지 않는다 (그림의 일부)
+            txt = "".join("".join(ch["c"] for ch in s_["chars"]) for s_ in l["spans"]).strip()
+            letters = sum(ch.isalpha() for ch in txt)
+            if len(txt) < 12 or letters < len(txt) * 0.55 or bogus(l):
+                continue
+            r = pymupdf.Rect(l["bbox"])
+            x0, y0 = max(0, int((r.x0 - 2) / k)), max(0, int((r.y0 - 2) / k))
+            x1, y1 = int((r.x1 + 2) / k) + 1, int((r.y1 + 2) / k) + 1
+            ink[y0:y1, x0:x1] = False
+    c = 3                                               # 3px = 6pt 칸
+    h, w = ink.shape[0] // c, ink.shape[1] // c
+    grid = ink[: h * c, : w * c].reshape(h, c, w, c).mean(axis=(1, 3)) > 0.06
+    # 가까운 칸끼리 잇기 위해 두 칸(12pt)씩 넓힌다 — 흐린 상자그림·점그래프도 한 덩어리가 되게
+    g = grid.copy()
+    for _ in range(2):
+        base = g.copy()
+        g[1:, :] |= base[:-1, :]
+        g[:-1, :] |= base[1:, :]
+        g[:, 1:] |= base[:, :-1]
+        g[:, :-1] |= base[:, 1:]
+    seen = np.zeros_like(g)
+    cands: list[tuple[pymupdf.Rect, float]] = []
+    for yy in range(h):
+        for xx in range(w):
+            if not g[yy, xx] or seen[yy, xx]:
+                continue
+            stack = [(yy, xx)]
+            seen[yy, xx] = True
+            ys, xs, n = [yy, yy], [xx, xx], 0
+            while stack:
+                y, x = stack.pop()
+                n += 1
+                ys[0], ys[1] = min(ys[0], y), max(ys[1], y)
+                xs[0], xs[1] = min(xs[0], x), max(xs[1], x)
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and g[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((ny, nx))
+            r = pymupdf.Rect((xs[0] + 2) * c * k, (ys[0] + 2) * c * k, (xs[1] - 1) * c * k, (ys[1] - 1) * c * k)
+            # 가는 선(표 괘선, 밑줄)이나 작은 얼룩은 그림이 아니다
+            if os.environ.get("INK_DEBUG"):
+                print("cand", [round(v) for v in r], n)
+            if r.width >= 20 and r.height >= 40 and n >= 25:
+                py0, py1 = int(r.y0 / k), int(r.y1 / k)
+                px0, px1 = int(r.x0 / k), int(r.x1 / k)
+                total = int(ink[py0:py1, px0:px1].sum())
+                outside = int(resid[py0:py1, px0:px1].sum())
+                ratio = outside / total if total else 0.0
+                if os.environ.get("INK_DEBUG"):
+                    print("  ratio", [round(v) for v in r], round(ratio, 2))
+                cands.append((r, ratio))
+    # 그림 판정: 글자 밖 잉크 비율이 0.3 이상이면 그림. 0.15 이상인 조각은 옆에 나란히 붙은
+    # 그림 조각이 있을 때만 그림으로 (여러 패널 그림에서 눈금 글자가 많은 패널)
+    keep = [ratio >= 0.3 and r.width >= 50 for r, ratio in cands]
+    changed = True
+    while changed:
+        changed = False
+        for i, (r, ratio) in enumerate(cands):
+            if keep[i] or ratio < 0.15:
+                continue
+            for j, (q, _) in enumerate(cands):
+                if keep[j] and min(r.y1, q.y1) - max(r.y0, q.y0) >= 0.5 * min(r.height, q.height) \
+                        and max(r.x0, q.x0) - min(r.x1, q.x1) <= 60:
+                    keep[i] = changed = True
+                    break
+    rects = [r for (r, _), kp in zip(cands, keep) if kp]
+    # 그림 둘레의 짧은 글(축 눈금, 범례, 그림 속 글자)도 그림에 포함한다
+    out = []
+    for r in rects:
+        grown = pymupdf.Rect(r)
+        for b in raw["blocks"]:
+            for l in b.get("lines", []):
+                lr = pymupdf.Rect(l["bbox"])
+                txt = "".join(s_["text"] if "text" in s_ else "".join(ch["c"] for ch in s_["chars"])
+                              for s_ in l["spans"]).strip()
+                if len(txt) <= 30 and (lr & (r + (-14, -14, 14, 14))).is_valid and \
+                        not (lr & (r + (-14, -14, 14, 14))).is_empty and not CAPTION_RE.match(txt):
+                    grown |= lr
+        out.append(grown)
+    return out
+
+
+FIG_CAPTION_RE = re.compile(r"^(FIGURE|Figure|Fig\.)\s*\d+")
+
+
+def _caption_anchored_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
+    """스캔 쪽 그림 찾기 2: 'Figure n.' 캡션 바로 위, 위쪽 본문 문단이 끝나는 곳부터 캡션까지를 그림으로 본다.
+    (학술지는 그림 캡션을 그림 아래에 둔다. 흐린 그래프도 놓치지 않는다)"""
+    lines = []
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            if abs(l["dir"][0] - 1) > 0.01:
+                continue
+            t = "".join("".join(ch["c"] for ch in s_["chars"]) for s_ in l["spans"]).strip()
+            if t:
+                lines.append((pymupdf.Rect(l["bbox"]), t, pymupdf.Rect(b["bbox"])))
+
+    def prose(r: pymupdf.Rect, t: str) -> bool:
+        return len(t) >= 30 and sum(ch.isalpha() for ch in t) >= len(t) * 0.7
+
+    out = []
+    for r, t, braw in lines:
+        if not FIG_CAPTION_RE.match(t):
+            continue
+        cap = pymupdf.Rect(braw) if braw.y0 >= r.y0 - 2 else pymupdf.Rect(r)
+        x0, x1 = cap.x0, cap.x1
+        # 기본 위 경계: 러닝 헤더(쪽 맨 위 짧은 줄) 바로 아래
+        head = [lr.y1 for lr, lt, _ in lines if lr.y1 < page.rect.height * 0.12]
+        top = (max(head) + 3) if head else page.rect.height * 0.09
+        # 캡션 위로 올라가며, 위아래로 이어진 본문 문단(2줄 이상)을 만나면 거기가 그림의 위 경계
+        above = sorted([(lr, lt) for lr, lt, _ in lines if lr.y1 <= cap.y0 - 1 and
+                        min(lr.x1, x1) - max(lr.x0, x0) > 0.5 * min(lr.width, x1 - x0)],
+                       key=lambda z: -z[0].y1)
+        for k, (lr, lt) in enumerate(above):
+            if not prose(lr, lt):
+                continue
+            prev = [(qr, qt) for qr, qt in above[k + 1:]
+                    if 0 <= lr.y0 - qr.y1 <= 8 and abs(qr.x0 - lr.x0) <= 6 and prose(qr, qt)]
+            if prev:
+                top = lr.y1 + 2
+                break
+        # 캡션이 쪽 가운데에 걸쳐 있으면 그림은 본문 전체 폭일 수 있다
+        mid = page.rect.width / 2
+        if x0 < mid - 40 and x1 > mid + 40:
+            prose_x = [lr for lr, lt, _ in lines if prose(lr, lt)]
+            if prose_x:
+                x0 = min(x0, min(lr.x0 for lr in prose_x))
+                x1 = max(x1, max(lr.x1 for lr in prose_x))
+        region = pymupdf.Rect(x0 - 4, top, x1 + 4, cap.y0 - 2)
+        if region.height >= 40 and region.width >= 50:
+            out.append(region)
+    return out
+
+
 def _figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
-    """그림·표·도식 영역: 이미지 블록 + 벡터 도형 묶음. 가까운 것끼리 합친다."""
+    """그림·표·도식 영역: 이미지 블록 + 벡터 도형 묶음 (+ 스캔 쪽은 캡션 위 영역·잉크 덩어리). 가까운 것끼리 합친다."""
     rects: list[pymupdf.Rect] = []
+    if _page_is_image_backed(page):
+        try:
+            anchored = _caption_anchored_regions(page, raw)
+        except Exception:
+            anchored = []
+        try:
+            ink = _ink_figure_regions(page, raw)
+        except Exception:
+            ink = []
+        rects += anchored + ink        # 겹치는 것은 아래에서 하나로 합쳐진다
+    area = page.rect.width * page.rect.height
     for b in raw["blocks"]:
         if b["type"] == 1:
             r = pymupdf.Rect(b["bbox"])
-            if r.width >= MIN_FIG[0] and r.height >= MIN_FIG[1]:
+            if r.width >= MIN_FIG[0] and r.height >= MIN_FIG[1] and r.width * r.height < area * 0.8:
                 rects.append(r)
     try:
         page_area = page.rect.width * page.rect.height
@@ -242,6 +430,22 @@ def _figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
             else:
                 out.append(pymupdf.Rect(r))
         rects = out
+    # 나란히 놓인 조각(여러 패널로 된 그림)은 하나로: 높이가 절반 이상 겹치고 좌우 간격 60pt 이내
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                overlap = min(a.y1, b.y1) - max(a.y0, b.y0)
+                gap = max(a.x0, b.x0) - min(a.x1, b.x1)
+                if overlap >= 0.5 * min(a.height, b.height) and gap <= 60:
+                    rects[i] = a | b
+                    del rects[j]
+                    merged = True
+                    break
+            if merged:
+                break
     return [r for r in rects if r.width >= MIN_FIG[0] and r.height >= MIN_FIG[1]]
 
 
@@ -373,7 +577,7 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
 
         html, plain = join_lines(lines)
         kind = "para"
-        if (bbox.y1 < HEADER_ZONE or bbox.y0 > H - FOOTER_ZONE) and len(plain) < 100:
+        if (bbox.y1 < max(HEADER_ZONE, H * 0.115) or bbox.y0 > H - FOOTER_ZONE) and len(plain) < 100:
             kind = "header"
         elif CAPTION_RE.match(plain) and (plain[:5].isupper() or size < body * 0.95):
             kind = "caption"
@@ -403,6 +607,7 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
 
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
+    _carry_across_columns(ordered, page.rect)
     return {"mode": "text", "body_size": body, "blocks": _merge_headings(ordered)}
 
 
@@ -443,47 +648,104 @@ def _merge_headings(blocks: list[dict]) -> list[dict]:
 
 
 # ─────────────────────── 2. 읽기 순서 ───────────────────────
-def detect_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> int:
-    """본문 블록 대부분이 페이지 폭의 절반보다 좁고 좌우로 나뉘어 있으면 2단."""
-    body = [b for b in blocks if b["kind"] in ("para", "list", "heading")]
-    if len(body) < 3:
-        return 1
+def _gutter(blocks: list[dict], page_rect: pymupdf.Rect) -> float | None:
+    """2단이면 두 단 사이 가운데 x, 1단이면 None.
+    본문 블록 대부분이 쪽 가운데선을 넘지 않고 좌우 양쪽에 있으면 2단으로 본다."""
     mid = page_rect.width / 2
-    narrow = [b for b in body if b["bbox"].width < page_rect.width * 0.55]
-    left = [b for b in narrow if b["bbox"].x1 <= mid + 10]
-    right = [b for b in narrow if b["bbox"].x0 >= mid - 10]
-    return 2 if len(narrow) >= len(body) * 0.6 and left and right else 1
+    body = [b for b in blocks if b["kind"] in ("para", "list", "heading", "dialogue", "reference", "note")
+            and not b["bbox"].is_empty and b["bbox"].width > 20]
+    if len(body) < 3:
+        return None
+    left = [b for b in body if b["bbox"].x1 <= mid + 12]
+    right = [b for b in body if b["bbox"].x0 >= mid - 12]
+    if not left or not right or len(left) + len(right) < len(body) * 0.6:
+        return None
+    lx1 = max(b["bbox"].x1 for b in left)
+    rx0 = min(b["bbox"].x0 for b in right)
+    return (lx1 + rx0) / 2 if lx1 < rx0 else mid
+
+
+def detect_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> int:
+    return 1 if _gutter(blocks, page_rect) is None else 2
+
+
+def _spans(b: dict, gutter: float) -> bool:
+    """가운데 단 사이를 가로지르는 블록(제목, 초록, 두 단에 걸친 그림·표).
+    단 경계를 조금 넘는 정도(그림 눈금 글자 등)는 가로지르는 것으로 보지 않는다."""
+    return b["bbox"].x0 < gutter - 40 and b["bbox"].x1 > gutter + 40
+
+
+def column_segments(blocks: list[dict], page_rect: pymupdf.Rect) -> tuple[float | None, list[tuple]]:
+    """본문 블록 → 위에서부터 [("span", [블록]) | ("cols", 왼쪽[], 오른쪽[])] 구간 목록.
+    각주도 자기 단 안에 둔다(원문 위치 그대로). 위치 정보가 없는 블록(참고문헌 등)은 바로 앞 블록을 따른다."""
+    gutter = _gutter(blocks, page_rect)
+    body = [b for b in blocks if b["kind"] != "header"]
+    if gutter is None:
+        return None, [("span", body)]
+    segs: list[tuple] = []
+    left: list[dict] = []
+    right: list[dict] = []
+    last_side = "L"
+    positioned = []
+    for b in body:                       # 위치 없는 블록은 앞 블록에 붙여 둔다
+        if b["bbox"].is_empty and positioned:
+            positioned[-1][1].append(b)
+        else:
+            positioned.append((b, []))
+    for b, tail in sorted(positioned, key=lambda t: t[0]["bbox"].y0):
+        if not b["bbox"].is_empty and _spans(b, gutter):
+            if left or right:
+                segs.append(("cols", left, right))
+                left, right = [], []
+            segs.append(("span", [b] + tail))
+            continue
+        side = last_side if b["bbox"].is_empty else ("L" if (b["bbox"].x0 + b["bbox"].x1) / 2 < gutter else "R")
+        (left if side == "L" else right).extend([b] + tail)
+        last_side = side
+    if left or right:
+        segs.append(("cols", left, right))
+
+    def key(x: dict) -> float:
+        return x["bbox"].y0 if not x["bbox"].is_empty else 1e9
+
+    out = []
+    for seg in segs:
+        if seg[0] == "cols":
+            # 단 안에서는 원래 순서(y) — 위치 없는 블록은 앞 블록과 함께 움직이도록 안정 정렬
+            out.append(("cols", _stable_y(seg[1]), _stable_y(seg[2])))
+        else:
+            out.append(seg)
+    return gutter, out
+
+
+def _stable_y(blocks: list[dict]) -> list[dict]:
+    groups: list[list[dict]] = []
+    for b in blocks:
+        if b["bbox"].is_empty and groups:
+            groups[-1].append(b)
+        else:
+            groups.append([b])
+    groups.sort(key=lambda g: g[0]["bbox"].y0)
+    return [b for g in groups for b in g]
 
 
 def sort_reading_order(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict]:
-    """헤더 → (전체 폭 블록 / 왼쪽 단 / 오른쪽 단) → 각주 순서.
-
-    2단일 때: 전체 폭 블록(제목·초록·양단에 걸친 그림)을 만나면 그때까지 쌓인 왼쪽 단,
-    오른쪽 단을 차례로 내보낸다. 그래서 '그림 위의 2단 → 그림 → 그림 아래의 2단'도 맞게 나온다.
-    한계: 3단 이상, 단을 가로지르는 표, 박스 기사 등은 순서가 어긋날 수 있다.
-    """
+    """헤더 → (가로지르는 블록 / 왼쪽 단 / 오른쪽 단 …) → 각주.
+    2단이면 가로지르는 블록(제목·초록·두 단에 걸친 그림)을 만날 때마다 그때까지의 왼쪽 단, 오른쪽 단을
+    차례로 내보낸다. 그래서 '그림 위의 2단 → 그림 → 그림 아래의 2단'도 맞게 나온다.
+    한계: 3단 이상, 박스 기사 등은 순서가 어긋날 수 있다."""
     header = sorted([b for b in blocks if b["kind"] == "header"], key=lambda b: b["bbox"].y0)
-    foot = sorted([b for b in blocks if b["kind"] == "footnote"], key=lambda b: b["bbox"].y0)
-    body = [b for b in blocks if b["kind"] not in ("header", "footnote")]
-
-    if detect_columns(blocks, page_rect) == 1:
-        body.sort(key=lambda b: (round(b["bbox"].y0), b["bbox"].x0))
-        return header + body + foot
-
-    mid = page_rect.width / 2
+    foot = [b for b in blocks if b["kind"] == "footnote"]
+    rest = [b for b in blocks if b["kind"] not in ("header", "footnote")]
+    gutter, segs = column_segments(rest, page_rect)
+    if gutter is None:
+        body = sorted(rest, key=lambda b: (round(b["bbox"].y0), b["bbox"].x0))
+        return header + body + sorted(foot, key=lambda b: b["bbox"].y0)
     ordered: list[dict] = []
-    left: list[dict] = []
-    right: list[dict] = []
-    for b in sorted(body, key=lambda b: b["bbox"].y0):
-        if b["bbox"].width > page_rect.width * 0.6:
-            ordered += sorted(left, key=lambda x: x["bbox"].y0) + sorted(right, key=lambda x: x["bbox"].y0)
-            left, right = [], []
-            ordered.append(b)
-        elif (b["bbox"].x0 + b["bbox"].x1) / 2 < mid:
-            left.append(b)
-        else:
-            right.append(b)
-    ordered += sorted(left, key=lambda x: x["bbox"].y0) + sorted(right, key=lambda x: x["bbox"].y0)
+    for seg in segs:
+        ordered += seg[1] if seg[0] == "span" else seg[1] + seg[2]
+    # 각주는 왼쪽 단 → 오른쪽 단 순서
+    foot.sort(key=lambda b: (0 if (b["bbox"].x0 + b["bbox"].x1) / 2 < gutter else 1, b["bbox"].y0))
     return header + ordered + foot
 
 
@@ -505,6 +767,21 @@ def mark_references(pages: list[dict]) -> None:
         def flush() -> None:
             if not ref_lines:
                 return
+            # 2단이면 단마다 따로 나눈다 (각 단의 왼쪽 여백이 항목 시작 기준)
+            xs0 = [l["x0"] for l in ref_lines]
+            xs1 = [l["bbox"].x1 if "bbox" in l else l["x0"] for l in ref_lines]
+            mid = (min(xs0) + max(xs1)) / 2
+            left = [l for l in ref_lines if l["x0"] < mid - 10]
+            right = [l for l in ref_lines if l["x0"] >= mid - 10]
+            if left and right and len(right) >= 3:
+                ref_lines[:] = left
+                flush_one()
+                ref_lines[:] = right
+            flush_one()
+
+        def flush_one() -> None:
+            if not ref_lines:
+                return
             margin = min(l["x0"] for l in ref_lines)
             # 번호식 참고문헌([1] … / 1. …)이면 번호로 시작하는 줄에서만 새 항목
             numbered_style = sum(bool(re.match(r"^\s*(\[\d+\]|\d+\.)\s", l["text"])) for l in ref_lines) \
@@ -517,7 +794,11 @@ def mark_references(pages: list[dict]) -> None:
                 entries[-1].append(ln)
             for e in entries:
                 h, p = join_lines(e)
-                new_blocks.append({"kind": "reference", "bbox": pymupdf.Rect(), "size": e[0]["size"],
+                r = pymupdf.Rect()
+                for ln in e:
+                    if "bbox" in ln:
+                        r = pymupdf.Rect(ln["bbox"]) if r.is_empty else r | ln["bbox"]
+                new_blocks.append({"kind": "reference", "bbox": r, "size": e[0]["size"],
                                    "html": _protect(h), "text": p})
             ref_lines.clear()
 
@@ -565,10 +846,18 @@ def carry_cross_page(pages: list[dict]) -> None:
         first = next((b for b in nxt if b["kind"] == "para"), None)
         if first is None or (first is not nxt[0] and not first["text"][:1].islower()):
             continue
-        if SENTENCE_END_RE.search(last["text"]):
-            continue
         if last["size"] < pages[i]["body_size"] * 0.95 or first["size"] < pages[i + 1]["body_size"] * 0.95:
             continue                              # 작은 글씨(교신저자 안내 등)는 이어 붙이지 않음
+        if _carry_sentence(last, first):
+            if not first["text"]:
+                pages[i + 1]["blocks"].remove(first)
+
+
+def _carry_sentence(last: dict, first: dict) -> bool:
+    """last가 문장 중간에서 끊겼으면 first의 첫 문장을 last 끝으로 옮긴다. 옮겼으면 True."""
+    if True:
+        if SENTENCE_END_RE.search(last["text"]):
+            return False
         cut = _first_sentence_split(first["text"])
         moved = first["text"][:cut].strip()
         if cut >= len(first["text"]):           # 다음 문단 전체가 한 문장이면 통째로
@@ -577,7 +866,7 @@ def carry_cross_page(pages: list[dict]) -> None:
             tail = esc(moved[-20:])
             pos = first["html"].find(tail)
             if pos < 0:
-                continue
+                return False
             hcut = pos + len(tail)
             m = re.match(r"(\s*</(?:i|b|sup|span)>)+", first["html"][hcut:])
             if m:                               # 닫는 태그까지 함께 가져온다
@@ -590,10 +879,24 @@ def carry_cross_page(pages: list[dict]) -> None:
             last["text"] += " " + moved
         first["html"] = first["html"][hcut:].strip()
         first["text"] = first["text"][cut:].strip()
-        if not first["text"]:
-            pages[i + 1]["blocks"].remove(first)
-        else:
+        if first["text"]:
             first["no_indent"] = True
+        return True
+
+
+def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
+    """2단 쪽에서 왼쪽 단 끝 문단이 문장 중간에서 끊겨 오른쪽 단으로 이어지면,
+    그 문장은 왼쪽 단에서 완결한다 (각 단이 따로 번역되므로)."""
+    gutter, segs = column_segments([b for b in blocks if b["kind"] not in ("header", "footnote")], page_rect)
+    if gutter is None:
+        return
+    for seg in segs:
+        if seg[0] != "cols" or not seg[1] or not seg[2]:
+            continue
+        last, first = seg[1][-1], seg[2][0]
+        if last["kind"] == "para" and first["kind"] == "para" and first["text"][:1].islower():
+            if _carry_sentence(last, first) and not first["text"]:
+                blocks.remove(first)
 
 
 def extract_document(doc: pymupdf.Document) -> list[dict]:
@@ -608,7 +911,8 @@ def extract_document(doc: pymupdf.Document) -> list[dict]:
         pages.append(pg)
     if pages and pages[0]["mode"] == "text":
         for b in pages[0]["blocks"]:
-            if b["kind"] == "header" and re.search(r"(doi|DOI|\d{4}\)?\s*\d+[:(]|Vol\.|ISSN)", b["text"]):
+            if b["kind"] == "header" and not re.fullmatch(r"\s*\d{1,4}\s*", b["text"]) and \
+                    b["bbox"].y1 < pages[0].get("_h", 1e9):
                 b["kind"] = "meta"
         metas = [b for b in pages[0]["blocks"] if b["kind"] == "meta"]
         rest = [b for b in pages[0]["blocks"] if b["kind"] != "meta"]
@@ -667,53 +971,60 @@ def apply_translations(pg: dict, units: list[tuple[int, int | None, str]], resul
 
 
 # ─────────────────────── 5. 번역 페이지 조판 ───────────────────────
-CSS = f"""
+def make_css(lh: float = 1.32) -> str:
+    return _CSS_TEMPLATE.replace("{LH}", f"{lh:.2f}").replace("{LH_SMALL}", f"{max(1.15, lh - 0.1):.2f}")
+
+
+_CSS_TEMPLATE = f"""
 @font-face {{ font-family: kr; src: url({FONT_REGULAR}); }}
 @font-face {{ font-family: kr; src: url({FONT_BOLD}); font-weight: bold; }}
 * {{ font-family: kr; }}
 body {{ color: #1a1a1a; }}
-p {{ margin: 0 0 0.4em 0; line-height: {LINE_HEIGHT}; text-align: left; }}
+p {{ margin: 0 0 0.4em 0; line-height: {{LH}}; text-align: left; }}
 p.para {{ text-indent: 1em; }}
 p.center {{ text-align: center; }}
 h1 {{ font-size: 1.5em; font-weight: bold; text-align: center; line-height: 1.35; margin: 0.4em 0 0.8em 0; }}
 h2 {{ font-size: 1.05em; font-weight: bold; text-align: center; margin: 0.6em 0 0.5em 0; }}
 h3 {{ font-size: 1.0em; font-weight: bold; margin: 0.6em 0 0.35em 0; }}
 ul {{ margin: 0.1em 0 0.5em 1.6em; padding: 0; }}
-li {{ line-height: {LINE_HEIGHT}; margin-bottom: 0.15em; }}
+li {{ line-height: {{LH}}; margin-bottom: 0.15em; }}
 b {{ font-weight: bold; }}
 sup {{ font-size: 0.7em; }}
 .cap {{ font-size: 0.85em; text-align: center; margin: 0.2em 0 0.7em 0; }}
 .fig {{ text-align: center; margin: 0.3em 0 0.2em 0; }}
-.dlg {{ margin: 0 1.2em 0.2em 1.2em; padding-left: 1.2em; text-indent: -1.2em; }}
+.dlg {{ line-height: {{LH}}; margin: 0 1.2em 0.2em 1.2em; padding-left: 1.2em; text-indent: -1.2em; }}
 .meta {{ font-size: 0.75em; color: #666; line-height: 1.35; margin: 0 0 0.6em 0; }}
-.note {{ font-size: 0.85em; line-height: 1.45; margin: 0 0 0.25em 1.5em; }}
-.fn {{ font-size: 0.8em; line-height: 1.45; color: #333; }}
+.note {{ font-size: 0.85em; line-height: {{LH_SMALL}}; margin: 0 0 0.25em 1.5em; }}
+.fn {{ font-size: 0.8em; line-height: {{LH_SMALL}}; color: #333; }}
 .ref {{ font-size: 0.8em; line-height: 1.4; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
 .tcap {{ text-align: center; font-size: 1.0em; margin: 0 0 0.6em 0; line-height: 1.35; }}
 table.tbl {{ border-collapse: collapse; }}
 table.first {{ border-top: 0.8px solid #333; }}
 th {{ font-size: 0.85em; font-weight: bold; text-align: left; vertical-align: bottom;
-      padding: 0.2em 0.3em; border-bottom: 0.6px solid #333; }}
+      padding: 0.1em 0.3em; border-bottom: 0.6px solid #333; line-height: 1.22; }}
 th.sup {{ text-align: center; }}
-td {{ font-size: 0.85em; vertical-align: top; padding: 0.25em 0.3em; line-height: 1.35; }}
-p.ti {{ margin: 0 0 0.2em 0; padding-left: 0.8em; text-indent: -0.8em; text-align: left; line-height: 1.35; }}
-p.tp {{ margin: 0 0 0.2em 0; text-align: left; line-height: 1.35; }}
+td {{ font-size: 0.85em; vertical-align: top; padding: 0.05em 0.3em; line-height: 1.22; }}
+p.ti {{ margin: 0 0 0.1em 0; padding-left: 0.8em; text-indent: -0.8em; text-align: left; line-height: 1.22; }}
+p.tp {{ margin: 0; text-align: left; line-height: 1.22; }}
 .tnote {{ font-size: 0.8em; margin-top: 0.5em; border-top: 0.8px solid #333; padding-top: 0.3em; }}
 u {{ text-decoration: underline; }}
+i {{ font-style: italic; }}
 hr {{ border: none; border-top: 0.5px solid #999; width: 30%; margin: 0.6em 0 0.4em 0; }}
 """
+CSS = make_css(LINE_HEIGHT)
 
 
 def to_reading_html(tr_html: str, italic_to_bold: bool = True) -> str:
-    """번역 결과의 <i>(원문 이탤릭)를 <b>로 바꾸고, 번역금지 span은 벗긴다."""
+    """번역 결과의 <i>(원문 기울임 강조)를 '굵게 + 밑줄'로 바꾸고, 번역금지 span은 벗긴다.
+    italic_to_bold=False(참고문헌)면 원문처럼 기울임으로 둔다."""
     s = re.sub(r'<span translate="no">(.*?)</span>', r"\1", tr_html, flags=re.S)
     if italic_to_bold:
-        return re.sub(r"<i>(.*?)</i>", r"<b>\1</b>", s, flags=re.S)
-    return re.sub(r"</?i>", "", s)
+        return re.sub(r"<i>(.*?)</i>", r"<b><u>\1</u></b>", s, flags=re.S)
+    return s
 
 
 def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
-    """번역된 블록 → 페이지 HTML 조각 목록(페이지가 넘칠 때 나누는 단위)."""
+    """번역된 블록 → HTML 조각 목록. 각주는 맨 끝에 구분선과 함께."""
     out: list[str] = []
     for b in blocks:
         k = b["kind"]
@@ -750,6 +1061,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             out.append(f'<p class="ref">{to_reading_html(tr, italic_to_bold=False)}</p>')
         elif k == "figure" and b.get("img_name"):
             w, h = b["bbox"].width, b["bbox"].height
+            if w > box_width - 4:                       # 단 폭보다 넓으면 비율 유지하며 줄인다
+                h, w = h * (box_width - 4) / w, box_width - 4
             out.append(f'<p class="fig"><img src="{b["img_name"]}" width="{w:.0f}" height="{h:.0f}"/></p>')
     foot = [b for b in blocks if b["kind"] == "footnote"]
     if foot:
@@ -795,12 +1108,6 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
         return 1
 
     blocks = pg["blocks"]
-    rects = [b["bbox"] for b in blocks if b["kind"] != "header" and not b["bbox"].is_empty] or [src.rect]
-    # 한국어는 영어보다 길어지므로 원문 본문 폭보다 조금 넓게(좌우 여백 34pt까지) 쓴다
-    left = min(min(r.x0 for r in rects) - 4, 34)
-    right = max(max(r.x1 for r in rects) + 4, W - 34)
-    box = pymupdf.Rect(max(left, 24), 52, min(right, W - 24), H - 30)
-
     for b in blocks:                           # 그림은 원문에서 잘라 PNG로
         if b["kind"] == "figure":
             name = f"fig_{pno}_{int(b['bbox'].y0)}_{int(b['bbox'].x0)}.png"
@@ -808,27 +1115,118 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
             archive.add(pix.tobytes("png"), name)
             b["img_name"] = name
 
-    pieces = _pieces(blocks, box.width) or ['<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>']
-    css = CSS + f"body {{ font-size: {pg['body_size'] * FONT_BOOST:.1f}pt; }}"
-    added = 0
-    while pieces:
-        # 남은 조각을 최대한 많이 담을 수 있는 개수 찾기 (전부 → 하나씩 줄이기)
-        k = len(pieces)
-        while k > 1:
-            trial = pymupdf.open()
-            spare, _ = trial.new_page(width=W, height=H).insert_htmlbox(
-                box, "".join(pieces[:k]), css=css, archive=archive, scale_low=MIN_SCALE)
-            trial.close()
-            if spare >= 0:
+    regions = page_regions(blocks, src.rect)
+    html = [("".join(_pieces(bl, r.width)), r) for r, bl in regions]
+    html = [(h, r) for h, r in html if h]
+    if not html:
+        html = [('<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>', pymupdf.Rect(40, 60, W - 40, 120))]
+
+    font, lh = _fit(html, W, H, archive, pg["body_size"])
+    page = out.new_page(width=W, height=H)
+    if font is None:
+        # 가장 작은 글자로도 안 들어가는 극단적인 경우: 영역마다 따로 줄여서라도 이 쪽 안에 넣는다
+        for h, r in html:
+            page.insert_htmlbox(r, h, css=make_css(1.15) + f"body {{ font-size: {pg['body_size']:.1f}pt; }}",
+                                archive=archive, scale_low=0)
+    else:
+        css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
+        for h, r in html:
+            page.insert_htmlbox(r, h, css=css, archive=archive, scale_low=1)
+    page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50), _label_html(label), css=CSS, archive=archive)
+    return 1
+
+
+LINE_HEIGHTS = (1.6, 1.5, 1.42, 1.34, 1.27, 1.2)   # 넉넉한 것부터 — 글자를 줄이기 전에 줄간격부터 줄인다
+
+
+def _fit(html: list[tuple[str, pymupdf.Rect]], W: float, H: float, archive: pymupdf.Archive,
+         body_size: float) -> tuple[float | None, float]:
+    """쪽 전체에 같은 글자 크기를 쓰면서 모든 영역에 들어가는 (글자 크기, 줄간격)을 찾는다.
+    1) 가장 촘촘한 줄간격으로 들어가는 가장 큰 글자 크기를 찾고 (상한: 원문 본문 × FONT_BOOST)
+    2) 그 글자 크기에서 들어가는 가장 넉넉한 줄간격을 고른다."""
+    trial = pymupdf.open()
+
+    def fits(font: float, lh: float) -> bool:
+        css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
+        pg_ = trial.new_page(width=W, height=H)
+        ok = True
+        for h, r in html:
+            spare, _ = pg_.insert_htmlbox(r, h, css=css, archive=archive, scale_low=1)
+            if spare < 0:
+                ok = False
                 break
-            k -= 1
-        page = out.new_page(width=W, height=H)
-        page.insert_htmlbox(box, "".join(pieces[:k]), css=css, archive=archive, scale_low=MIN_SCALE)
-        page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50),
-                            _label_html(label + (" (계속)" if added else "")), css=CSS, archive=archive)
-        pieces = pieces[k:]
-        added += 1
-    return added
+        trial.delete_page(-1)
+        return ok
+
+    hi = body_size * FONT_BOOST
+    lo = body_size * 0.55
+    tight = LINE_HEIGHTS[-1]
+    if fits(hi, tight):
+        font = hi
+    elif not fits(lo, tight):
+        trial.close()
+        return None, tight
+    else:
+        a, b = lo, hi
+        for _ in range(7):
+            m = (a + b) / 2
+            if fits(m, tight):
+                a = m
+            else:
+                b = m
+        font = a
+    for lh in LINE_HEIGHTS:
+        if lh == tight or fits(font, lh):
+            trial.close()
+            return font, lh
+    trial.close()
+    return font, tight
+
+
+def page_regions(blocks: list[dict], page_rect: pymupdf.Rect) -> list[tuple[pymupdf.Rect, list[dict]]]:
+    """번역문을 놓을 영역들. 원문의 단 구성과 위치를 따른다.
+    1단: 본문 전체를 하나의 상자에.
+    2단: 위에서부터 '가로지르는 블록'은 전체 폭 상자, 그 사이 구간은 왼쪽 단·오른쪽 단 상자 두 개.
+    각 구간은 원문에서 그 구간이 시작하는 높이부터 다음 구간이 시작하는 높이까지 쓴다."""
+    W, H = page_rect.width, page_rect.height
+    body = [b for b in blocks if b["kind"] != "header"]
+    if not body:
+        return []
+    placed = [b for b in body if not b["bbox"].is_empty]
+    x0 = min((b["bbox"].x0 for b in placed), default=40)
+    x1 = max((b["bbox"].x1 for b in placed), default=W - 40)
+    # 한국어 줄이 조금 길어지므로 본문 폭을 좌우로 약간 넓힌다 (쪽 가장자리 28pt까지)
+    x0 = max(28, min(x0 - 6, 40))
+    x1 = min(W - 28, max(x1 + 6, W - 40))
+    top_y = min((b["bbox"].y0 for b in placed), default=60)
+    top = max(52.0, top_y - 30)
+    bottom = H - 28
+
+    gutter, segs = column_segments(body, page_rect)
+    if gutter is None:
+        return [(pymupdf.Rect(x0, top, x1, bottom), body)]
+
+    def seg_top(seg: tuple) -> float:
+        bl = seg[1] if seg[0] == "span" else seg[1] + seg[2]
+        ys = [b["bbox"].y0 for b in bl if not b["bbox"].is_empty]
+        return min(ys) if ys else top
+
+    tops = [seg_top(sg) for sg in segs]
+    tops[0] = top
+    regions: list[tuple[pymupdf.Rect, list[dict]]] = []
+    g = 7  # 단 사이 여백의 절반
+    for k, seg in enumerate(segs):
+        y0 = tops[k]
+        y1 = (tops[k + 1] - 3) if k + 1 < len(segs) else bottom
+        y1 = max(y1, y0 + 12)
+        if seg[0] == "span":
+            regions.append((pymupdf.Rect(x0, y0, x1, y1), seg[1]))
+        else:
+            if seg[1]:
+                regions.append((pymupdf.Rect(x0, y0, gutter - g, y1), seg[1]))
+            if seg[2]:
+                regions.append((pymupdf.Rect(gutter + g, y0, x1, y1), seg[2]))
+    return regions
 
 
 # ─────────────────────── 6. 텍스트 출력 ───────────────────────
@@ -967,3 +1365,23 @@ def apply_ocr(doc: pymupdf.Document, pages: list[dict], ocr: dict[str, list[dict
     if changed:
         carry_cross_page(out)
     return out
+
+
+# ─────────────────────── 8. 용어 첫 등장에 영어 병기 ───────────────────────
+def annotate_first_terms(pages: list[dict], glossary: dict[str, str]) -> None:
+    """용어집 용어가 논문에서 처음 나오는 번역문 한 곳에 '번역어(English)'로 영어를 병기한다(제자리 수정).
+    번역은 페이지별로 따로 하므로 '첫 등장'은 이렇게 다 모은 뒤 처리한다. 참고문헌·표는 건너뛴다."""
+    pending = {en: ko for en, ko in glossary.items() if en and ko}
+    if not pending:
+        return
+    for pg in pages:
+        for b in pg["blocks"]:
+            if b["kind"] in ("reference", "header", "meta", "figure", "table") or "tr" not in b:
+                continue
+            src = b["text"].lower()
+            for en, ko in list(pending.items()):
+                if en.lower() in src and ko in b["tr"] and f"{ko}(" not in b["tr"]:
+                    b["tr"] = b["tr"].replace(ko, f"{ko}({en})", 1)
+                    del pending[en]
+            if not pending:
+                return

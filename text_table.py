@@ -86,30 +86,57 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
                     return k
             return None
 
-        # 3) 모든 칸이 열에 맞는 행만, 위아래로 이어지는 동안
-        table_rows: list[list[dict]] = []
-        for r in run:
-            fit = [c for c in r if col_of(c["bbox"].x0) is not None]
-            if not fit:
-                if table_rows:
-                    break
-                continue
-            if len(fit) < len(r) and table_rows and not is_candidate(fit):
-                # 표 칸이 아닌 글이 끼어 있는 행(옆의 캡션 등)은 표 칸만 남긴다
-                pass
-            table_rows.append(fit)
+        # 3) 표의 가로 범위 안에 있는 칸만 본다 (같은 높이의 다른 단 글은 무시)
+        xmax = max(c["bbox"].x1 for r in cands for c in r) + 6
+        xmin = col_x[0] - 10
+
+        def in_range(c: dict) -> bool:
+            return xmin <= c["bbox"].x0 <= xmax
+
+        ranged = [[c for c in r if in_range(c)] for r in run]
+        ranged = [r for r in ranged if r]
+        def data_like(r: list[dict]) -> bool:
+            return is_candidate(r) and len(r) >= 2 and sum(col_of(c["bbox"].x0) is not None for c in r) >= 2
+
+        def has_num(r: list[dict]) -> bool:
+            return any(any(ch.isdigit() for ch in c["text"]) for c in r if col_of(c["bbox"].x0) != 0)
+
+        # 첫 데이터 행: 숫자 칸이 있는 첫 행 (숫자 표가 아니면 첫 후보 행)
+        numeric_table = sum(has_num(r) for r in ranged if data_like(r)) >= 3
+        first = next((k for k, r in enumerate(ranged) if data_like(r) and (has_num(r) or not numeric_table)), None)
+        if first is None:
+            i = j + 1
+            continue
+        # 위로: 여러 줄 머리행(첫 열 밖에도 칸이 있는 행)을 모은다. 첫 열에만 있는 한 줄은 표 제목이라 멈춘다
+        top = first
+        while top - 1 >= 0:
+            r = ranged[top - 1]
+            gap = ranged[top][0]["_yc"] - r[0]["_yc"]
+            only_col0 = all(col_of(c["bbox"].x0) == 0 for c in r) and len(r) == 1
+            if gap > r[0]["size"] * 2.6 or only_col0:
+                break
+            top -= 1
+        # 아래로: 행 간격이 크게 벌어지기 전까지
+        bot = first
+        while bot + 1 < len(ranged) and ranged[bot + 1][0]["_yc"] - ranged[bot][0]["_yc"] <= ranged[bot][0]["size"] * 3.2:
+            bot += 1
+        table_rows = ranged[top:bot + 1]
         if sum(1 for r in table_rows if len(r) >= 2) < 3:
             i = j + 1
             continue
         for r in run:
             used.add(id(r))
 
-        tables.append(_build(table_rows, col_x, col_of))
+        def nearest(x: float) -> int:
+            return min(range(len(col_x)), key=lambda k: abs(col_x[k] - x))
+
+        header_n = first - top          # 데이터 첫 행 위의 머리행 줄 수
+        tables.append(_build(table_rows, col_x, nearest, header_n))
         i = j + 1
     return tables
 
 
-def _build(rows: list[list[dict]], col_x: list[float], col_of) -> dict[str, Any]:
+def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0) -> dict[str, Any]:
     items: list[str] = []
     texts: list[str] = []
     ids: list[int] = []
@@ -128,14 +155,21 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of) -> dict[str, Any]
             cells[col_of(c["bbox"].x0)].append(add(c))
         grid.append(cells)
 
-    # 머리행: 첫 행에 숫자가 없고 둘째 행에 숫자가 있으면
+    # 머리행: 데이터 위의 여러 줄을 열마다 하나로 합친다 ('Native' + 'American %' → 'Native American %')
     def has_digit(cells: list[list[int]]) -> bool:
         return any(ch.isdigit() for cell in cells for i in cell for ch in texts[i])
 
     header: list[int | None] = [None] * ncol
-    if len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
-        header = [cell[0] if cell else None for cell in grid[0]]
-        grid = grid[1:]
+    if header_n == 0 and len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
+        header_n = 1
+    if header_n:
+        for c in range(ncol):
+            idxs = [i for r in grid[:header_n] for i in r[c]]
+            if idxs:
+                items.append(" ".join(items[i] for i in idxs))
+                texts.append(" ".join(texts[i] for i in idxs))
+                header[c] = len(items) - 1
+        grid = grid[header_n:]
 
     all_cells = [c for r in rows for c in r]
     x0 = min(c["bbox"].x0 for c in all_cells)
