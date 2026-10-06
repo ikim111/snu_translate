@@ -156,7 +156,8 @@ with st.sidebar:
         api_key = st.text_input("OpenAI API Key", value=secret("OPENAI_API_KEY"), type="password",
                                 help="platform.openai.com → API keys. 키는 저장되지 않습니다.")
         models = list(engines.OPENAI_MODELS)
-        model = st.selectbox("모델", models, index=models.index(engines.DEFAULT_OPENAI_MODEL),
+        default_model = getattr(engines, "DEFAULT_OPENAI_MODEL", models[0])
+        model = st.selectbox("모델", models, index=models.index(default_model) if default_model in models else 0,
                              format_func=lambda m: f"{m} ({engines.OPENAI_MODELS[m][0]})")
     target_label = st.selectbox("도착 언어", list(TARGETS))
     target = TARGETS[target_label]
