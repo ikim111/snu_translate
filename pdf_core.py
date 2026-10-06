@@ -18,6 +18,7 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
   footnote  각주 — 페이지 아래 구분선 밑에 배치
   note      본문 중간의 작은 글씨(그림 옆 면담 대화문 등) — 제자리에 작게
   reference 참고문헌 한 항목 — 옵션에 따라 원문 유지
+  table     가로로 돌려 놓은 표 (rotated_table.py) — 칸·항목 단위로 번역해 표로 다시 그림
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf
+
+import rotated_table
 
 # ─────────────────────────── 설정 ───────────────────────────
 FONT_DIR = Path(__file__).parent / "fonts"
@@ -215,7 +218,14 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
     body = body_size_of(raw)
     H = page.rect.height
     if _rotated_ratio(raw) > 0.5:
-        return {"mode": "image", "body_size": body, "blocks": []}
+        # 가로로 돌려 놓은 표 페이지: 칸 구조를 읽어 표로 번역. 실패하면 원문 그대로.
+        try:
+            table = rotated_table.extract_rotated_table(page)
+        except Exception:
+            table = None
+        if table is None:
+            return {"mode": "image", "body_size": body, "blocks": []}
+        return {"mode": "text", "body_size": table["size"], "blocks": [table]}
 
     figs = _figure_regions(page, raw)
     blocks: list[dict[str, Any]] = [
@@ -490,7 +500,27 @@ def extract_document(doc: pymupdf.Document) -> list[dict]:
         pages.append(pg)
     mark_references(pages)
     carry_cross_page(pages)
+    _repeat_table_headers(pages)
     return pages
+
+
+def _repeat_table_headers(pages: list[dict]) -> None:
+    """두 쪽에 걸친 표에서 둘째 쪽에 머리행이 없으면 앞쪽 머리행을 복사해 넣는다(읽기 편하게)."""
+    prev = None
+    for pg in pages:
+        tables = [b for b in pg["blocks"] if b["kind"] == "table"]
+        if not tables:
+            prev = None
+            continue
+        t = tables[0]
+        lay = t["layout"]
+        if prev is not None and all(h is None for h in lay["header"]) \
+                and len(prev["layout"]["header"]) == len(lay["header"]):
+            for c, h in enumerate(prev["layout"]["header"]):
+                if h is not None:
+                    t["items"].append(prev["items"][h])
+                    lay["header"][c] = len(t["items"]) - 1
+        prev = t
 
 
 def translatable_units(pg: dict, translate_refs: bool = False,
@@ -503,7 +533,7 @@ def translatable_units(pg: dict, translate_refs: bool = False,
             continue
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
-        if k == "list":
+        if k in ("list", "table"):
             units += [(bi, ii, h) for ii, h in enumerate(b["items"])]
         elif b["html"].strip():
             units.append((bi, None, b["html"]))
@@ -541,6 +571,17 @@ sup {{ font-size: 0.7em; }}
 .note {{ font-size: 0.85em; line-height: 1.45; margin: 0 0 0.25em 1.5em; }}
 .fn {{ font-size: 0.8em; line-height: 1.45; color: #333; }}
 .ref {{ font-size: 0.8em; line-height: 1.4; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
+.tcap {{ text-align: center; font-size: 1.0em; margin: 0 0 0.6em 0; line-height: 1.35; }}
+table.tbl {{ border-collapse: collapse; }}
+table.first {{ border-top: 0.8px solid #333; }}
+th {{ font-size: 0.85em; font-weight: bold; text-align: left; vertical-align: bottom;
+      padding: 0.2em 0.3em; border-bottom: 0.6px solid #333; }}
+th.sup {{ text-align: center; }}
+td {{ font-size: 0.85em; vertical-align: top; padding: 0.25em 0.3em; line-height: 1.35; }}
+p.ti {{ margin: 0 0 0.2em 0; padding-left: 0.8em; text-indent: -0.8em; text-align: left; line-height: 1.35; }}
+p.tp {{ margin: 0 0 0.2em 0; text-align: left; line-height: 1.35; }}
+.tnote {{ font-size: 0.8em; margin-top: 0.5em; border-top: 0.8px solid #333; padding-top: 0.3em; }}
+u {{ text-decoration: underline; }}
 hr {{ border: none; border-top: 0.5px solid #999; width: 30%; margin: 0.6em 0 0.4em 0; }}
 """
 
@@ -553,7 +594,7 @@ def to_reading_html(tr_html: str, italic_to_bold: bool = True) -> str:
     return re.sub(r"</?i>", "", s)
 
 
-def _pieces(blocks: list[dict]) -> list[str]:
+def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
     """번역된 블록 → 페이지 HTML 조각 목록(페이지가 넘칠 때 나누는 단위)."""
     out: list[str] = []
     for b in blocks:
@@ -579,6 +620,8 @@ def _pieces(blocks: list[dict]) -> list[str]:
             out.append(f'<p class="cap">{to_reading_html(tr)}</p>')
         elif k == "note":
             out.append(f'<p class="note">{to_reading_html(tr)}</p>')
+        elif k == "table":
+            out += rotated_table.table_pieces(b, to_reading_html, box_width)
         elif k == "reference":
             # 참고문헌은 학술지명 이탤릭을 볼드로 바꾸지 않는다 (지저분해짐)
             out.append(f'<p class="ref">{to_reading_html(tr, italic_to_bold=False)}</p>')
@@ -640,7 +683,7 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
             archive.add(pix.tobytes("png"), name)
             b["img_name"] = name
 
-    pieces = _pieces(blocks) or ['<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>']
+    pieces = _pieces(blocks, box.width) or ['<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>']
     css = CSS + f"body {{ font-size: {pg['body_size']:.1f}pt; }}"
     added = 0
     while pieces:
@@ -681,6 +724,17 @@ def page_text(pg: dict, translated: bool = True) -> str:
         elif k == "list":
             items = (b.get("tr_items") or b["items"]) if translated else b["items"]
             parts.append("\n".join("• " + plain(t) for t in items))
+        elif k == "table":
+            items = (b.get("tr_items") or b["items"]) if translated else b["items"]
+            lay = b["layout"]
+            rows = []
+            if lay.get("title"):
+                rows.append(" ".join(plain(items[i]) for i in lay["title"]))
+            for row in lay["rows"]:
+                rows.append(" | ".join("; ".join(plain(items[i]) for i in cell) for cell in row))
+            if lay.get("note") is not None:
+                rows.append(plain(items[lay["note"]]))
+            parts.append("\n".join(rows))
         else:
             parts.append(plain(b.get("tr", b["html"]) if translated else b["html"]))
     return "\n\n".join(parts)

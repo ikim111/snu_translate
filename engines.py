@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 # ─────────────────────────── 공통 ───────────────────────────
 BATCH_CHARS = 20_000      # 요청 1회에 보낼 최대 글자 수
-TAG_RE = re.compile(r"<(i|b|sup)>|translate=\"no\"")
+TAG_RE = re.compile(r"<(i|b|u|sup)>|translate=\"no\"")
 
 # OpenAI 모델과 1M 토큰당 가격(USD, 입력/출력). 2026년 10월 공식 문서 기준 — 바뀌면 여기만 고치면 된다.
 OPENAI_MODELS: dict[str, tuple[str, float, float]] = {
@@ -54,7 +54,7 @@ def _plain_len(html: str) -> int:
 
 def _tag_counts(html: str) -> list[int]:
     found = TAG_RE.findall(html)
-    return [found.count(t) for t in ("i", "b", "sup")] + [html.count('translate="no"')]
+    return [found.count(t) for t in ("i", "b", "u", "sup")] + [html.count('translate="no"')]
 
 
 def split_text_into_chunks(text: str, limit: int = BATCH_CHARS) -> list[str]:
@@ -180,7 +180,7 @@ the same number of items, in the same order, one translation per input segment.
 Rules — follow all of them strictly:
 1. Translate EVERY sentence completely. Never summarize, shorten, merge, or skip anything,
    including direct quotations, examples, and parenthetical remarks.
-2. Keep the HTML tags <i>, </i>, <b>, </b>, <sup>, </sup> and wrap the corresponding translated
+2. Keep the HTML tags <i>, </i>, <b>, </b>, <u>, </u>, <sup>, </sup> and wrap the corresponding translated
    words with them. Keep every <span translate="no">...</span> exactly as it is, untranslated.
 3. Keep author names in their original spelling, years, statistics such as p < .05,
    F(2, 318) = 4.52, M = 3.24, SD = 0.81, numbers, URLs and DOIs exactly as in the source.
