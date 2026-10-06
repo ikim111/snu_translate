@@ -27,7 +27,6 @@ import pdf_core as core
 # ─────────────────────────── 설정 ───────────────────────────
 CACHE_DIR = Path(".translation_cache")
 BATCH_CHARS = 20_000            # DeepL 요청 1회에 보낼 최대 글자 수 (요청 한도 128KiB보다 넉넉히 작게)
-FREE_MONTHLY = 500_000          # DeepL API Free 월 한도 (안내용)
 TARGETS = {"한국어 (KO)": "KO", "영어 (EN-US)": "EN-US"}
 DEFAULT_GLOSSARY = "self-efficacy = 자기효능감\nmathematical confidence = 수학 자신감\nstatistical thinking = 통계적 사고"
 
@@ -258,7 +257,7 @@ todo = [pg for pg in sel if pg["mode"] == "text" and str(pg["page_number"]) not 
 need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
 done_in_range = sum(1 for pg in sel if str(pg["page_number"]) in cache)
 st.info(f"선택 범위 {len(sel)}쪽 중 {done_in_range}쪽 번역 완료 · 남은 예상 사용량 약 {need_chars:,}자 "
-        f"(DeepL Free 월 {FREE_MONTHLY:,}자)")
+        "(실제 남은 한도는 번역 시작 시 DeepL에서 확인해 보여 줍니다)")
 
 with st.expander("이전 진행 상황 불러오기 / 저장하기"):
     st.caption("앱이 재시작되면 서버의 캐시가 사라질 수 있습니다. 진행 파일을 받아 두었다가 올리면 이어서 번역합니다.")
