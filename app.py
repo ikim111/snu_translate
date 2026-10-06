@@ -1,8 +1,9 @@
 """
-논문 정독용 PDF 번역기 (Streamlit + DeepL + PyMuPDF)
+논문 정독용 PDF 번역기 (Streamlit + DeepL/OpenAI + PyMuPDF)
 
 실행:  streamlit run app.py
-구성:  app.py      화면, DeepL 호출, 캐시, 다운로드
+구성:  app.py      화면, 캐시, 다운로드
+       engines.py  번역 엔진 (DeepL / OpenAI)
        pdf_core.py PDF 추출·읽기 순서·문단 복원·그림/표·참고문헌·번역 PDF 조판
        fonts/      번역 PDF에 넣을 한글 글꼴 (나눔고딕, OFL)
 
@@ -14,19 +15,18 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import deepl
 import pymupdf
 import streamlit as st
 
+import engines
 import pdf_core as core
 
 # ─────────────────────────── 설정 ───────────────────────────
 CACHE_DIR = Path(".translation_cache")
-BATCH_CHARS = 20_000            # DeepL 요청 1회에 보낼 최대 글자 수 (요청 한도 128KiB보다 넉넉히 작게)
 TARGETS = {"한국어 (KO)": "KO", "영어 (EN-US)": "EN-US"}
 DEFAULT_GLOSSARY = "self-efficacy = 자기효능감\nmathematical confidence = 수학 자신감\nstatistical thinking = 통계적 사고"
 
@@ -43,7 +43,7 @@ def secret(name: str) -> str:
 
 # ─────────────────────── 접근 비밀번호 (선택) ───────────────────────
 # Streamlit Cloud의 Secrets에 APP_PASSWORD를 넣으면 비밀번호를 아는 사람만 쓸 수 있다.
-# DEEPL_API_KEY까지 Secrets에 넣는 경우에는 꼭 설정할 것 (안 그러면 남이 내 한도를 쓴다).
+# DEEPL_API_KEY / OPENAI_API_KEY를 Secrets에 넣는 경우에는 꼭 설정할 것 (안 그러면 남이 내 한도를 쓴다).
 if secret("APP_PASSWORD") and not st.session_state.get("authed"):
     st.title("📄 논문 번역기")
     pw = st.text_input("비밀번호", type="password")
@@ -57,9 +57,17 @@ if secret("APP_PASSWORD") and not st.session_state.get("authed"):
 
 # ─────────────────────────── 사이드바 ───────────────────────────
 with st.sidebar:
-    st.header("DeepL 설정")
-    api_key = st.text_input("DeepL API Key", value=secret("DEEPL_API_KEY"), type="password",
-                            help="키는 저장되지 않습니다. Free 키는 ':fx'로 끝나며 SDK가 알아서 Free 서버로 연결합니다.")
+    st.header("번역 엔진")
+    engine_name = st.radio("엔진", ["DeepL", "OpenAI"], horizontal=True, label_visibility="collapsed")
+    if engine_name == "DeepL":
+        api_key = st.text_input("DeepL API Key", value=secret("DEEPL_API_KEY"), type="password",
+                                help="키는 저장되지 않습니다. SDK가 키 종류에 맞는 서버로 연결합니다.")
+        model = ""
+    else:
+        api_key = st.text_input("OpenAI API Key", value=secret("OPENAI_API_KEY"), type="password",
+                                help="platform.openai.com → API keys. 키는 저장되지 않습니다.")
+        model = st.selectbox("모델", list(engines.OPENAI_MODELS),
+                             format_func=lambda m: f"{m} ({engines.OPENAI_MODELS[m][0]})")
     target_label = st.selectbox("도착 언어", list(TARGETS))
     target = TARGETS[target_label]
 
@@ -111,94 +119,6 @@ def save_cache(key: str, data: dict[str, Any]) -> None:
         pass   # 디스크 캐시 실패해도 session_state에는 남아 있다
 
 
-# ─────────────────────────── DeepL ───────────────────────────
-def make_translator(key: str) -> deepl.Translator:
-    # 키를 코드에 저장하지 않는다. Free/Pro 서버 선택은 SDK가 키 형식(':fx')으로 처리.
-    return deepl.Translator(key.strip())
-
-
-def get_glossary(translator: deepl.Translator, entries: dict[str, str]) -> Any:
-    """용어집을 DeepL에 만들고(같은 내용이면 재사용) 반환. 실패하면 None."""
-    if not entries:
-        return None
-    sig = hashlib.md5(json.dumps(entries, sort_keys=True).encode()).hexdigest()[:10]
-    cached = st.session_state.get("glossary")
-    if cached and cached[0] == sig:
-        return cached[1]
-    try:
-        g = translator.create_glossary(f"snu_translate_{sig}", source_lang="EN", target_lang="KO",
-                                       entries=entries)
-        st.session_state.glossary = (sig, g)
-        return g
-    except deepl.DeepLException as e:
-        st.warning(f"용어집을 만들지 못해 용어집 없이 번역합니다: {e}")
-        st.session_state.glossary = (sig, None)
-        return None
-
-
-def translate_batch(translator: deepl.Translator, texts: list[str], glossary: Any) -> list[str]:
-    """여러 조각을 한 번에 번역 (BATCH_CHARS 단위로 나눠 요청). 태그는 HTML로 보존."""
-    results: list[str] = []
-    batch: list[str] = []
-    size = 0
-
-    def send(chunk: list[str]) -> None:
-        kw: dict[str, Any] = dict(target_lang=target, tag_handling="html")
-        if glossary is not None:
-            kw.update(source_lang="EN", glossary=glossary)
-        try:
-            res = translator.translate_text(chunk, model_type="prefer_quality_optimized", **kw)
-        except deepl.DeepLException as e:
-            if "model_type" not in str(e):
-                raise
-            res = translator.translate_text(chunk, **kw)
-        results.extend(r.text for r in (res if isinstance(res, list) else [res]))
-
-    for t in texts:
-        for piece in split_text_into_chunks(t):
-            if batch and size + len(piece) > BATCH_CHARS:
-                send(batch)
-                batch, size = [], 0
-            batch.append(piece)
-            size += len(piece)
-    if batch:
-        send(batch)
-
-    # 긴 조각을 나눠 보낸 경우 다시 합친다
-    merged: list[str] = []
-    i = 0
-    for t in texts:
-        n = len(split_text_into_chunks(t))
-        merged.append(" ".join(results[i:i + n]))
-        i += n
-    return merged
-
-
-def split_text_into_chunks(text: str, limit: int = BATCH_CHARS) -> list[str]:
-    """한 조각이 너무 길 때만 나눈다: 문단 → 문장 → (최후) 공백 위치 순서로.
-    논문 한 문단이 2만 자를 넘는 일은 거의 없어서 대부분 그대로 1조각이다."""
-    if len(text) <= limit:
-        return [text]
-    parts = re.split(r"(?<=[.?!])\s+", text)
-    chunks: list[str] = []
-    cur = ""
-    for p in parts:
-        while len(p) > limit:                      # 문장 하나가 한도보다 길면 공백에서 자름
-            cut = p.rfind(" ", 0, limit)
-            if cut <= 0:
-                cut = limit
-            chunks.append(p[:cut])
-            p = p[cut:].lstrip()
-        if len(cur) + len(p) + 1 > limit:
-            chunks.append(cur)
-            cur = p
-        else:
-            cur = f"{cur} {p}".strip()
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
 # ─────────────────────────── 메인 화면 ───────────────────────────
 st.title("📄 논문 정독용 번역기")
 st.caption("원문 1쪽 = 번역 1쪽. 그림·표는 원문 그대로, 이탤릭은 볼드로 표시됩니다.")
@@ -239,7 +159,7 @@ if bad:
 start, end = st.slider("번역할 페이지 범위", 1, n_pages, (1, n_pages))
 sel = [pg for pg in pages if start <= pg["page_number"] <= end]
 
-opts_sig = hashlib.md5(json.dumps([target, translate_refs, translate_captions, glossary_entries],
+opts_sig = hashlib.md5(json.dumps([engine_name, model, target, translate_refs, translate_captions, glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
 if st.session_state.get("cache_key") != cache_key:
@@ -256,8 +176,12 @@ def units_of(pg: dict) -> list[tuple[int, int | None, str]]:
 todo = [pg for pg in sel if pg["mode"] == "text" and str(pg["page_number"]) not in cache]
 need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
 done_in_range = sum(1 for pg in sel if str(pg["page_number"]) in cache)
-st.info(f"선택 범위 {len(sel)}쪽 중 {done_in_range}쪽 번역 완료 · 남은 예상 사용량 약 {need_chars:,}자 "
-        "(실제 남은 한도는 번역 시작 시 DeepL에서 확인해 보여 줍니다)")
+if engine_name == "OpenAI":
+    krw = engines.openai_cost_krw(model, need_chars)
+    cost = f" · 예상 비용 약 {krw:,}원" if krw is not None else ""
+else:
+    cost = " (DeepL 남은 한도는 번역 시작 시 확인해 보여 줍니다)"
+st.info(f"선택 범위 {len(sel)}쪽 중 {done_in_range}쪽 번역 완료 · 남은 원문 약 {need_chars:,}자{cost}")
 
 with st.expander("이전 진행 상황 불러오기 / 저장하기"):
     st.caption("앱이 재시작되면 서버의 캐시가 사라질 수 있습니다. 진행 파일을 받아 두었다가 올리면 이어서 번역합니다.")
@@ -270,69 +194,79 @@ with st.expander("이전 진행 상황 불러오기 / 저장하기"):
                 save_cache(cache_key, cache)
                 st.success("불러왔습니다.")
             else:
-                st.warning("이 PDF·설정과 맞지 않는 진행 파일입니다 (도착 언어, 참고문헌·캡션 옵션, 용어집이 같아야 합니다).")
+                st.warning("이 PDF·설정과 맞지 않는 진행 파일입니다 (엔진·모델, 도착 언어, 참고문헌·캡션 옵션, 용어집이 같아야 합니다).")
         except Exception as e:
             st.error(f"진행 파일을 읽지 못했습니다: {e}")
     st.download_button("현재 진행 파일 받기", json.dumps({"_key": cache_key, **cache}, ensure_ascii=False),
                        file_name=f"{cache_key}.json", mime="application/json")
 
 # ─────────────────────────── 번역 실행 ───────────────────────────
+def make_engine() -> engines.Engine:
+    if engine_name == "DeepL":
+        return engines.make_deepl(api_key, target, glossary_entries,
+                                  st.session_state.setdefault("deepl_glossaries", {}))
+    return engines.make_openai(api_key, model, target, glossary_entries)
+
+
+def translate_page(engine: engines.Engine, pg: dict) -> list[str]:
+    units = units_of(pg)
+    return engine.translate([h for *_, h in units]) if units else []
+
+
 if st.button("번역 시작", type="primary", disabled=not todo):
     if not api_key:
-        st.error("사이드바에 DeepL API Key를 입력하세요.")
+        st.error(f"사이드바에 {engine_name} API Key를 입력하세요.")
         st.stop()
-    translator = make_translator(api_key)
     try:
-        usage = translator.get_usage()
-        if usage.character.valid:
-            left = usage.character.limit - usage.character.count
-            st.caption(f"DeepL 이번 달 남은 글자 수: {left:,}자")
-            if left < need_chars:
-                st.warning("남은 사용량이 예상 사용량보다 적습니다. 중간에 멈추면 다음 달이나 다른 키로 이어서 하세요.")
-    except deepl.AuthorizationException:
-        st.error("API Key 오류: 키가 올바르지 않습니다.")
+        engine = make_engine()
+        note = engine.check()
+    except engines.EngineError as e:
+        st.error(str(e))
         st.stop()
-    except deepl.ConnectionException as e:
-        st.error(f"네트워크 오류: DeepL 서버에 연결할 수 없습니다. ({e})")
+    except Exception as e:
+        st.error(f"번역 엔진을 준비하지 못했습니다: {e}")
         st.stop()
-    except deepl.DeepLException as e:
-        st.error(f"API 요청 실패: {e}")
-        st.stop()
+    if note:
+        st.caption(note)
 
-    glossary = get_glossary(translator, glossary_entries)
     bar = st.progress(0.0)
     status = st.empty()
     failures: dict[int, str] = {}
+    fatal: str | None = None
     st.caption("번역 중에는 화면의 다른 버튼을 누르지 마세요(새로 실행되며 멈춥니다). 멈춰도 끝난 페이지는 저장됩니다.")
 
-    for i, pg in enumerate(todo, 1):
-        pno = pg["page_number"]
-        status.write(f"**Page {pno}** 번역 중… ({i}/{len(todo)})")
-        units = units_of(pg)
-        try:
-            tr = translate_batch(translator, [h for *_, h in units], glossary) if units else []
-            cache[str(pno)] = {"tr": tr, "original": core.page_text(pg, translated=False)}
-            save_cache(cache_key, cache)
-        except deepl.AuthorizationException:
-            st.error("API Key 오류: 키가 올바르지 않거나 권한이 없습니다.")
-            break
-        except deepl.QuotaExceededException:
-            st.error(f"DeepL 사용량 초과: Page {pno}에서 멈췄습니다. 지금까지 번역한 페이지는 저장되어 있습니다.")
-            break
-        except deepl.TooManyRequestsException:
-            failures[pno] = "요청이 너무 많음(잠시 후 다시 시도)"
-        except deepl.ConnectionException as e:
-            failures[pno] = f"네트워크 오류: {e}"
-        except deepl.DeepLException as e:
-            failures[pno] = f"API 요청 실패: {e}"
-        except Exception as e:
-            failures[pno] = f"번역 실패: {e}"
-        bar.progress(i / len(todo))
+    # 페이지 단위로 번역하고, 끝나는 대로 저장한다. OpenAI는 여러 페이지를 동시에 보낸다.
+    done = 0
+    with ThreadPoolExecutor(max_workers=engine.workers) as pool:
+        futures = {pool.submit(translate_page, engine, pg): pg for pg in todo}
+        status.write(f"번역 중… 0 / {len(todo)}쪽")
+        for fut in as_completed(futures):
+            pg = futures[fut]
+            pno = pg["page_number"]
+            try:
+                tr = fut.result()
+                cache[str(pno)] = {"tr": tr, "original": core.page_text(pg, translated=False)}
+                save_cache(cache_key, cache)
+            except engines.EngineError as e:
+                failures[pno] = str(e)
+                if e.fatal and fatal is None:
+                    fatal = str(e)
+                    for f in futures:            # 아직 시작 안 한 페이지는 취소
+                        f.cancel()
+            except Exception as e:
+                failures[pno] = f"번역 실패: {e}"
+            done += 1
+            bar.progress(done / len(todo))
+            status.write(f"번역 중… {done} / {len(todo)}쪽 (방금 끝난 페이지: {pno})")
+
     status.write(f"번역 완료 페이지: {sum(1 for pg in sel if str(pg['page_number']) in cache)} / {len(sel)}")
-    for pno, msg in failures.items():
-        st.error(f"Page {pno} 번역 실패 — {msg}")
+    if fatal:
+        st.error(f"{fatal} — 번역을 멈췄습니다. 지금까지 번역한 페이지는 저장되어 있습니다.")
+    for pno, msg in sorted(failures.items()):
+        if msg != fatal:
+            st.error(f"Page {pno} 번역 실패 — {msg}")
     if failures:
-        st.info("'번역 시작'을 다시 누르면 실패한 페이지부터 이어서 번역합니다.")
+        st.info("'번역 시작'을 다시 누르면 남은 페이지부터 이어서 번역합니다.")
     st.session_state.pop("built", None)
 
 
