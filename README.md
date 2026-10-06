@@ -11,6 +11,7 @@
 - 참고문헌은 기본적으로 원문 유지 (옵션)
 - 용어집으로 학술 용어 번역을 통일
 - 번역은 페이지마다 저장 → 중간에 멈춰도 이어서 번역, 진행 파일(.json) 내려받기/올리기 가능
+- 📚 **내 서재**: 번역한 논문을 GitHub 비공개 저장소에 자동 보관, 목록·검색·다시 받기·삭제
 
 ## 파일 구성
 
@@ -18,6 +19,7 @@
 |---|---|
 | `app.py` | Streamlit 화면, 캐시, 다운로드 |
 | `engines.py` | 번역 엔진: DeepL / OpenAI (모델·가격 표도 여기에) |
+| `library.py` | 내 서재: GitHub 비공개 저장소에 번역본 보관 |
 | `pdf_core.py` | PDF 추출, 읽기 순서(2단 포함), 문단 복원, 그림·표·참고문헌, 번역 PDF 조판 |
 | `fonts/` | 번역 PDF용 한글 글꼴 (나눔고딕, SIL OFL) |
 
@@ -45,6 +47,26 @@ APP_PASSWORD = "나만-아는-비밀번호"
 
 12시간 동안 아무도 접속하지 않으면 앱이 잠들고, 다시 접속하면 깨어납니다. 이때 서버의 번역 캐시가
 사라질 수 있으니, 긴 논문은 화면의 **진행 파일 받기**로 저장해 두세요.
+
+## 📚 내 서재 연결 (선택)
+
+Streamlit 무료 서버의 저장 공간은 앱이 잠들거나 다시 배포되면 지워집니다.
+번역본을 계속 보관하려면 **비공개** GitHub 저장소를 서재로 연결하세요.
+
+1. GitHub에서 **Private** 저장소를 만듭니다 (예: `snu_translate_library`). 이 공개 저장소(`snu_translate`)에는
+   논문 번역본을 넣지 마세요.
+2. GitHub → Settings → Developer settings → **Fine-grained personal access tokens** → Generate new token
+   - Repository access: **Only select repositories** → 위 비공개 저장소 하나만
+   - Permissions → Repository permissions → **Contents: Read and write**
+3. Streamlit Secrets에 추가합니다.
+
+```toml
+LIBRARY_REPO = "ikim111/snu_translate_library"
+GITHUB_TOKEN = "github_pat_..."
+```
+
+연결하면 번역이 끝날 때마다 논문 전체(번역한 쪽 + 아직 번역 안 한 쪽은 원문)가 자동 저장되고,
+같은 PDF를 다시 올리면 서재의 번역을 불러와 번역비 없이 바로 받을 수 있습니다.
 
 ## 번역 엔진 고르기
 

@@ -4,6 +4,7 @@
 실행:  streamlit run app.py
 구성:  app.py      화면, 캐시, 다운로드
        engines.py  번역 엔진 (DeepL / OpenAI)
+       library.py  '내 서재' — 번역본을 GitHub 비공개 저장소에 보관
        pdf_core.py PDF 추출·읽기 순서·문단 복원·그림/표·참고문헌·번역 PDF 조판
        fonts/      번역 PDF에 넣을 한글 글꼴 (나눔고딕, OFL)
 
@@ -23,6 +24,7 @@ import pymupdf
 import streamlit as st
 
 import engines
+import library
 import pdf_core as core
 
 # ─────────────────────────── 설정 ───────────────────────────
@@ -55,7 +57,93 @@ if secret("APP_PASSWORD") and not st.session_state.get("authed"):
     st.stop()
 
 
+# ─────────────────────────── 내 서재 ───────────────────────────
+def get_library() -> library.Library | None:
+    """Secrets에 LIBRARY_REPO와 GITHUB_TOKEN이 있으면 서재를 쓴다."""
+    repo, token = secret("LIBRARY_REPO"), secret("GITHUB_TOKEN")
+    return library.Library(repo, token) if repo and token else None
+
+
+lib = get_library()
+
+
+def same_paper_and_settings(key_a: str, key_b: str) -> bool:
+    """진행 파일 키 비교: 파일 이름은 달라도 PDF 해시와 번역 설정이 같으면 같은 번역."""
+    return key_a.split("_")[-2:] == key_b.split("_")[-2:]
+
+
+def render_library() -> None:
+    st.title("📚 내 서재")
+    if lib is None:
+        st.info("서재가 아직 연결되지 않았습니다. Streamlit Secrets에 아래 두 줄을 넣으면 번역한 논문이 "
+                "GitHub 비공개 저장소에 자동으로 보관됩니다.")
+        st.code('LIBRARY_REPO = "ikim111/snu_translate_library"\nGITHUB_TOKEN = "github_pat_..."', language="toml")
+        return
+    c1, c2 = st.columns([4, 1])
+    c1.caption(f"보관 위치: GitHub `{lib.repo}` (비공개)")
+    if c2.button("새로고침") or "lib_items" not in st.session_state:
+        try:
+            lib.check()
+            st.session_state.lib_items = lib.list_papers()
+        except library.LibraryError as e:
+            st.error(str(e))
+            return
+    items: list[dict] = st.session_state.lib_items
+    if not items:
+        st.write("아직 저장된 논문이 없습니다. 번역을 마치면 자동으로 여기에 저장됩니다.")
+        return
+
+    query = st.text_input("검색", placeholder="제목이나 파일 이름 일부")
+    if query:
+        q = query.lower()
+        items = [m for m in items if q in m.get("title", "").lower() or q in m.get("filename", "").lower()]
+    st.caption(f"{len(items)}편")
+
+    for m in items:
+        pid = m["id"]
+        with st.container(border=True):
+            st.markdown(f"**{m.get('title') or m.get('filename')}**")
+            st.caption(f"{m.get('updated', '')} · {m.get('engine', '')} · "
+                       f"번역 {m.get('translated', '?')}/{m.get('total_pages', '?')}쪽 "
+                       f"(p.{m.get('range', ['?', '?'])[0]}–{m.get('range', ['?', '?'])[1]}) · {m.get('filename', '')}")
+            b1, b2, b3 = st.columns([2, 2, 1])
+            for col, name, label, mime in ((b1, "translation.pdf", "📕 번역 PDF", "application/pdf"),
+                                           (b2, "original.pdf", "📄 원문 PDF", "application/pdf")):
+                key = f"dl_{pid}_{name}"
+                if key in st.session_state:
+                    stem = Path(m.get("filename", pid)).stem[:60]
+                    suffix = "_번역" if name == "translation.pdf" else ""
+                    col.download_button(f"{label} 저장", st.session_state[key],
+                                        file_name=f"{stem}{suffix}.pdf", mime=mime, key=f"{key}_btn")
+                elif col.button(f"{label} 불러오기", key=f"{key}_get"):
+                    try:
+                        data = lib.get_file(pid, name)
+                    except library.LibraryError as e:
+                        col.error(str(e))
+                        data = None
+                    if data:
+                        st.session_state[key] = data
+                        st.rerun()
+                    elif data is None:
+                        col.warning("파일이 없습니다.")
+            with b3.popover("삭제"):
+                st.write("서재에서 이 논문을 지웁니다. (GitHub 기록에는 남습니다)")
+                if st.button("삭제", key=f"del_{pid}", type="primary"):
+                    try:
+                        lib.delete_paper(pid)
+                        st.session_state.lib_items = [x for x in st.session_state.lib_items if x["id"] != pid]
+                        st.rerun()
+                    except library.LibraryError as e:
+                        st.error(str(e))
+
+
 # ─────────────────────────── 사이드바 ───────────────────────────
+with st.sidebar:
+    menu = st.radio("메뉴", ["번역하기", "📚 내 서재"], horizontal=True, label_visibility="collapsed")
+if menu == "📚 내 서재":
+    render_library()
+    st.stop()
+
 with st.sidebar:
     st.header("번역 엔진")
     engine_name = st.radio("엔진", ["OpenAI", "DeepL"], horizontal=True, label_visibility="collapsed",
@@ -165,11 +253,33 @@ opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, target, trans
                                    glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
+paper_id = pdf_hash[:16]
 if st.session_state.get("cache_key") != cache_key:
     st.session_state.cache_key = cache_key
     st.session_state.cache = load_cache(cache_key)
     st.session_state.pop("built", None)
+    st.session_state.lib_meta = None
+    # 서버 캐시가 비었으면(앱이 잠들었다 깨어난 경우 등) 서재에 보관된 번역을 불러온다 → 번역비 없음
+    if lib is not None:
+        try:
+            raw = lib.get_file(paper_id, "progress.json")
+            if raw:
+                data = json.loads(raw.decode("utf-8"))
+                if same_paper_and_settings(data.get("_key", ""), cache_key):
+                    if not st.session_state.cache:
+                        st.session_state.cache = {k: v for k, v in data.items() if not k.startswith("_")}
+                        save_cache(cache_key, st.session_state.cache)
+                        st.toast("서재에 보관된 번역을 불러왔습니다.")
+                else:
+                    meta_raw = lib.get_file(paper_id, "meta.json")
+                    st.session_state.lib_meta = json.loads(meta_raw) if meta_raw else {}
+        except (library.LibraryError, ValueError):
+            pass
 cache: dict[str, Any] = st.session_state.cache
+if st.session_state.get("lib_meta") is not None:
+    m = st.session_state.lib_meta
+    st.info(f"이 논문은 서재에 다른 설정({m.get('engine', '?')}, {m.get('updated', '?')})으로 번역한 기록이 있습니다. "
+            "그 번역본을 그대로 받으려면 사이드바의 **📚 내 서재**로 가세요. 지금 설정으로 번역하면 서재의 기록이 새 번역으로 바뀝니다.")
 
 
 def units_of(pg: dict) -> list[tuple[int, int | None, str]]:
@@ -202,7 +312,7 @@ with st.expander("이전 진행 상황 불러오기 / 저장하기"):
     if up is not None:
         try:
             data = json.loads(up.getvalue().decode("utf-8"))
-            if data.get("_key") == cache_key:
+            if same_paper_and_settings(data.get("_key", ""), cache_key):
                 cache.update({k: v for k, v in data.items() if not k.startswith("_")})
                 save_cache(cache_key, cache)
                 st.success("불러왔습니다.")
@@ -282,6 +392,7 @@ if st.button("번역 시작", type="primary", disabled=not todo):
     if failures:
         st.info("'번역 시작'을 다시 누르면 남은 페이지부터 이어서 번역합니다.")
     st.session_state.pop("built", None)
+    st.session_state.autosave = True          # 아래에서 PDF를 만든 뒤 서재에 저장
 
 
 # ─────────────────────────── 결과 만들기 ───────────────────────────
@@ -295,11 +406,11 @@ def translated_page(pg: dict) -> dict | None:
     return tpg
 
 
-def build_outputs() -> dict[str, bytes]:
+def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
     out = pymupdf.open()
     txt: list[str] = []
     md: list[str] = [f"# {Path(uploaded.name).stem}\n"]
-    for pg in sel:
+    for pg in (sel if page_list is None else page_list):
         pno = pg["page_number"]
         tpg = translated_page(pg)
         if interleave:
@@ -334,6 +445,49 @@ if translated_count:
                        type="primary")
     d2.download_button("TXT", files["txt"], file_name=f"{stem}.txt", mime="text/plain")
     d3.download_button("Markdown", files["md"], file_name=f"{stem}.md", mime="text/markdown")
+
+    def paper_title() -> str:
+        for pg in pages[:3]:
+            for b in pg["blocks"]:
+                if b.get("title"):
+                    return b["text"][:150]
+        return Path(uploaded.name).stem
+
+    def save_to_library() -> None:
+        # 서재에는 범위와 상관없이 '논문 전체'를 저장한다. 나눠서 번역해도 지금까지 번역한
+        # 모든 쪽이 한 파일에 모이고, 아직 번역하지 않은 쪽은 원문 그대로 들어간다.
+        done_pages = [pg["page_number"] for pg in pages if cached_ok(pg)]
+        with st.spinner("서재용 전체 PDF 만드는 중…"):
+            full_pdf = build_outputs(pages)["pdf"]
+        meta = {
+            "id": paper_id, "title": paper_title(), "filename": uploaded.name,
+            "total_pages": n_pages, "range": [min(done_pages), max(done_pages)],
+            "translated": len(done_pages),
+            "engine": engine_name + (f" {model}" if model else ""), "cache_key": cache_key,
+        }
+        progress = json.dumps({"_key": cache_key, **cache}, ensure_ascii=False).encode("utf-8")
+        with st.spinner("서재에 저장하는 중…"):
+            lib.check()
+            lib.save_paper(meta, {"translation.pdf": full_pdf, "original.pdf": pdf_bytes,
+                                  "progress.json": progress})
+        st.session_state.pop("lib_items", None)
+        st.session_state.lib_meta = None
+
+    if lib is not None:
+        if st.session_state.pop("autosave", False):
+            try:
+                save_to_library()
+                st.success("📚 서재에 저장했습니다. 사이드바의 '내 서재'에서 언제든 다시 받을 수 있습니다.")
+            except library.LibraryError as e:
+                st.error(f"서재 저장 실패: {e}")
+        elif st.button("📚 서재에 저장"):
+            try:
+                save_to_library()
+                st.success("서재에 저장했습니다.")
+            except library.LibraryError as e:
+                st.error(f"서재 저장 실패: {e}")
+    else:
+        st.caption("📚 서재를 연결하면 번역본이 자동 보관됩니다 (사이드바 → 내 서재 참고).")
 
     # ── 미리보기: 원문 페이지와 번역 페이지를 나란히 ──
     st.subheader("미리보기")
