@@ -9,7 +9,7 @@
        fonts/      번역 PDF에 넣을 한글 글꼴 (나눔고딕, OFL)
 
 번역 PDF는 원문과 같은 판형으로, 원문 1쪽 = 번역 1쪽이 되도록 만든다.
-(내용이 넘치면 글자·줄간격을 줄이고, 그래도 넘치면 '(계속)' 페이지를 붙인다)
+(최소 본문 크기로 담을 수 없으면 해당 페이지를 알리고 PDF 생성을 중단한다)
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import streamlit as st
 import engines
 import library
 import pdf_core as core
+from progress import fingerprint
 
 # ─────────────────────────── 설정 ───────────────────────────
 CACHE_DIR = Path(".translation_cache")
@@ -103,7 +104,7 @@ def render_library() -> None:
         pid = m["id"]
         with st.container(border=True):
             st.markdown(f"**{m.get('title') or m.get('filename')}**")
-            st.caption(f"{m.get('updated', '')} · {m.get('engine', '')} · "
+            st.caption(f"{m.get('updated', '')} · 버전 {m.get('revision', '기존')[:8]} · {m.get('engine', '')} · "
                        f"번역 {m.get('translated', '?')}/{m.get('total_pages', '?')}쪽 "
                        f"(p.{m.get('range', ['?', '?'])[0]}–{m.get('range', ['?', '?'])[1]}) · {m.get('filename', '')}")
             b1, b2, b3 = st.columns([2, 2, 1])
@@ -259,9 +260,9 @@ if st.session_state.get("pdf_hash") != pdf_hash:
     st.session_state.pop("pages_ocr_sig", None)
     # 스캔 쪽 글자 읽기(OCR) 결과: 서버 캐시 → 서재 순으로 찾는다
     ocr: dict[str, Any] = load_cache(f"ocr_{paper_id}")
-    if not ocr and lib is not None and any(pg["mode"] == "scan" for pg in st.session_state.base_pages):
+    if not ocr and lib is not None:
         try:
-            raw = lib.get_file(paper_id, "ocr.json")
+            raw = lib.find_ocr(paper_id)
             if raw:
                 ocr = json.loads(raw.decode("utf-8"))
                 save_cache(f"ocr_{paper_id}", ocr)
@@ -270,7 +271,7 @@ if st.session_state.get("pdf_hash") != pdf_hash:
     st.session_state.ocr = ocr
 ocr_data: dict[str, Any] = st.session_state.ocr
 base_pages: list[dict] = st.session_state.base_pages
-ocr_sig = (pdf_hash, tuple(sorted(ocr_data)))
+ocr_sig = (pdf_hash, fingerprint(ocr_data))
 if st.session_state.get("pages_ocr_sig") != ocr_sig:
     st.session_state.pages = core.apply_ocr(src, base_pages, ocr_data) if ocr_data else base_pages
     st.session_state.pages_ocr_sig = ocr_sig
@@ -335,16 +336,41 @@ if scan_pages:
         if not fails:
             st.rerun()
 elif ocr_data:
-    st.caption("📷 스캔 쪽은 저장된 글자 읽기(OCR) 결과로 번역합니다.")
+    st.caption("📷 저장된 글자 읽기(OCR) 결과를 사용합니다.")
 bad = [pg["page_number"] for pg in pages if pg["mode"] == "error"]
 if bad:
     st.warning(f"텍스트 추출에 실패한 페이지: {bad} — 이 페이지들은 원문 그대로 들어갑니다.")
 
-start, end = st.slider("번역할 페이지 범위", 1, n_pages, (1, n_pages))
+start, end = st.slider("번역할 페이지 범위", 1, n_pages, (1, n_pages)) if n_pages > 1 else (1, 1)
 sel = [pg for pg in pages if start <= pg["page_number"] <= end]
 
+# Image-only figure labels need their own OCR pass; keep each result on its source page.
+pending_figures = [(pg, bi, b) for pg in sel for bi, b in enumerate(pg["blocks"])
+                   if b["kind"] == "figure" and not b.get("items") and not b.get("labels_checked")]
+if pending_figures:
+    st.warning(f"선택 범위의 그림 {len(pending_figures)}개는 내부 글자 확인이 필요합니다. "
+               "그림 글자 읽기를 실행하면 축 이름·범례를 번역해 그림 아래에 원문과 함께 표시합니다.")
+    figure_key = api_key if engine_name == "OpenAI" else secret("OPENAI_API_KEY")
+    figure_model = model if engine_name == "OpenAI" else engines.DEFAULT_OPENAI_MODEL
+    if st.button("그림 내부 글자 읽기 (OpenAI 사용료 발생)", disabled=not figure_key):
+        for pg, bi, block in pending_figures:
+            with st.spinner(f"p.{pg['page_number']} 그림 글자 읽는 중…"):
+                png = src[pg["page_number"] - 1].get_pixmap(clip=block["bbox"], dpi=200).tobytes("png")
+                try:
+                    found = engines.ocr_page(figure_key, figure_model, png,
+                        prompt=engines.OCR_PROMPT + "\nThis is a cropped figure. Transcribe ALL its visible "
+                        "labels, axis titles, legends and annotations as note blocks. Do not return figure blocks. "
+                        "Do not infer or describe the image. Return no blocks if there is no text.")
+                    labels = [core.plain(b["text"]).strip() for b in found if b.get("text", "").strip()]
+                    ocr_data[f"figure:{pg['page_number']}:{bi}"] = labels
+                    save_cache(f"ocr_{paper_id}", ocr_data)
+                except engines.EngineError as e:
+                    st.error(str(e))
+                    st.stop()
+        st.rerun()
+
 prompt_ver = engines.PROMPT_VERSION if engine_name == "OpenAI" else ""
-opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, target, translate_refs, translate_captions,
+opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, engines.VALIDATION_VERSION, core.LAYOUT_VERSION, target, translate_refs, translate_captions,
                                    glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
@@ -356,7 +382,7 @@ if st.session_state.get("cache_key") != cache_key:
     # 서버 캐시가 비었으면(앱이 잠들었다 깨어난 경우 등) 서재에 보관된 번역을 불러온다 → 번역비 없음
     if lib is not None:
         try:
-            raw = lib.get_file(paper_id, "progress.json")
+            raw = lib.find_progress(paper_id, cache_key)
             if raw:
                 data = json.loads(raw.decode("utf-8"))
                 if same_paper_and_settings(data.get("_key", ""), cache_key):
@@ -373,7 +399,7 @@ cache: dict[str, Any] = st.session_state.cache
 if st.session_state.get("lib_meta") is not None:
     m = st.session_state.lib_meta
     st.info(f"이 논문은 서재에 다른 설정({m.get('engine', '?')}, {m.get('updated', '?')})으로 번역한 기록이 있습니다. "
-            "그 번역본을 그대로 받으려면 사이드바의 **📚 내 서재**로 가세요. 지금 설정으로 번역하면 서재의 기록이 새 번역으로 바뀝니다.")
+            "그 번역본을 그대로 받으려면 사이드바의 **📚 내 서재**로 가세요. 새 번역은 별도 버전으로 보관됩니다.")
 
 
 def units_of(pg: dict) -> list[tuple[int, int | None, str]]:
@@ -387,7 +413,13 @@ def units_sig(pg: dict) -> str:
 def cached_ok(pg: dict) -> bool:
     """이 페이지의 번역이 캐시에 있고, 지금 추출한 원문 조각과 짝이 맞는지."""
     e = cache.get(str(pg["page_number"]))
-    return bool(e) and e.get("sig") == units_sig(pg) and len(e.get("tr", [])) == len(units_of(pg))
+    if not e or e.get("sig") != units_sig(pg):
+        return False
+    try:
+        engines.validate_results([h for *_, h in units_of(pg)], e.get("tr", []), target)
+    except engines.EngineError:
+        return False
+    return True
 
 
 todo = [pg for pg in sel if pg["mode"] == "text" and not cached_ok(pg)]
@@ -470,6 +502,7 @@ with st.expander("이전 진행 상황 불러오기 / 저장하기"):
             if same_paper_and_settings(data.get("_key", ""), cache_key):
                 cache.update({k: v for k, v in data.items() if not k.startswith("_")})
                 save_cache(cache_key, cache)
+                st.session_state.pop("built", None)
                 st.success("불러왔습니다.")
             else:
                 st.warning("이 PDF·설정과 맞지 않는 진행 파일입니다 (엔진·모델, 도착 언어, 참고문헌·캡션 옵션, 용어집이 같아야 합니다).")
@@ -488,7 +521,16 @@ def make_engine() -> engines.Engine:
 
 def translate_page(engine: engines.Engine, pg: dict) -> list[str]:
     units = units_of(pg)
-    return engine.translate([h for *_, h in units]) if units else []
+    texts = [h for *_, h in units]
+    index = pg["page_number"] - 1
+    context = ""
+    if index > 0:
+        context += "Previous page end:\n" + core.page_text(pages[index - 1], translated=False)[-1500:]
+    if index + 1 < len(pages):
+        context += "\nNext page start:\n" + core.page_text(pages[index + 1], translated=False)[:1500]
+    results = (engine.translate_context(texts, context) if engine.translate_context else engine.translate(texts)) if units else []
+    engines.validate_results(texts, results, target)
+    return results
 
 
 if st.button("번역 시작", type="primary", disabled=not todo):
@@ -584,6 +626,13 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
         orig = core.page_text(pg, translated=False)
         txt.append(f"──────────── Page {pno} ────────────\n\n{body}\n")
         md.append(f"# Page {pno}\n\n## Translation\n\n{body}\n\n## Original\n\n{orig}\n")
+    expected = len(plist) * (2 if interleave else 1)
+    if out.page_count != expected:
+        raise core.LayoutError("생성된 PDF의 페이지 수가 원문 범위와 맞지 않습니다.")
+    for i, pg in enumerate(plist):
+        actual = out[i * (2 if interleave else 1) + (1 if interleave else 0)].rect
+        if actual != src[pg["page_number"] - 1].rect:
+            raise core.LayoutError(f"p.{pg['page_number']}: 원문과 페이지 크기가 다릅니다.")
     out.subset_fonts()
     pdf = out.tobytes(garbage=4, deflate=True)
     return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8")}
@@ -591,10 +640,15 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
 
 translated_count = sum(1 for pg in sel if cached_ok(pg))
 if translated_count:
-    build_sig = (cache_key, start, end, interleave, len(cache))
+    build_sig = (cache_key, start, end, interleave, fingerprint(cache))
     if st.session_state.get("built", (None,))[0] != build_sig:
         with st.spinner("번역 PDF 만드는 중…"):
-            st.session_state.built = (build_sig, build_outputs())
+            try:
+                st.session_state.built = (build_sig, build_outputs())
+            except core.LayoutError as e:
+                st.session_state.pop("built", None)
+                st.error(str(e))
+                st.stop()
     files = st.session_state.built[1]
 
     st.subheader("다운로드")
@@ -638,13 +692,13 @@ if translated_count:
             try:
                 save_to_library()
                 st.success("📚 서재에 저장했습니다. 사이드바의 '내 서재'에서 언제든 다시 받을 수 있습니다.")
-            except library.LibraryError as e:
+            except (library.LibraryError, core.LayoutError) as e:
                 st.error(f"서재 저장 실패: {e}")
         elif st.button("📚 서재에 저장"):
             try:
                 save_to_library()
                 st.success("서재에 저장했습니다.")
-            except library.LibraryError as e:
+            except (library.LibraryError, core.LayoutError) as e:
                 st.error(f"서재 저장 실패: {e}")
     else:
         st.caption("📚 서재를 연결하면 번역본이 자동 보관됩니다 (사이드바 → 내 서재 참고).")
@@ -659,12 +713,17 @@ if translated_count:
         st.image(src[view_p - 1].get_pixmap(dpi=110).tobytes("png"), width="stretch")
     with right:
         st.caption(f"번역 p.{view_p}")
-        tpg = translated_page(pg)
+        preview_pages = [translated_page(p) for p in sel]
+        core.annotate_first_terms([p for p in preview_pages if p is not None], glossary_entries)
+        tpg = next((p for p in preview_pages if p is not None and p["page_number"] == view_p), None)
         if tpg is None:
             st.info("이 페이지는 아직 번역되지 않았습니다." if pg["mode"] == "text" else "원문 그대로 들어가는 페이지입니다.")
         else:
             one = pymupdf.open()
-            core.render_page(one, src, tpg)
+            try:
+                core.render_page(one, src, tpg)
+            except core.LayoutError as e:
+                st.error(str(e))
             for p in one:
                 st.image(p.get_pixmap(dpi=110).tobytes("png"), width="stretch")
     with st.expander("이 페이지 텍스트로 보기"):

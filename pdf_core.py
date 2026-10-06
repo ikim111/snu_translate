@@ -6,7 +6,7 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
                         참고문헌 구간, 페이지 경계 문장 처리까지 끝난 상태)
   (번역)              : 각 블록의 "html"을 DeepL에 tag_handling="html"로 보낸다 (app.py)
   render_page()       : 번역된 블록 → 원문과 같은 크기의 번역 페이지
-                        (넘치면 글자·줄간격 자동 축소, 하한선 아래면 "(계속)" 페이지)
+                        (넘치면 글자·줄간격 자동 축소, 하한선 아래면 LayoutError)
 
 블록 kind
   header    러닝 헤더/쪽수 — 번역 안 함, 출력 안 함
@@ -14,7 +14,7 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
   para      본문 문단
   list      글머리표 목록 (items)
   caption   FIGURE n / TABLE n 캡션
-  figure    그림·표·도식 영역 — 원문에서 이미지로 잘라 그대로 넣음 (내부 글자는 번역 안 함)
+  figure    그림·표·도식 영역 — 원문 이미지와 내부 글자의 원문·번역 병기
   footnote  각주 — 페이지 아래 구분선 밑에 배치
   note      본문 중간의 작은 글씨(그림 옆 면담 대화문 등) — 제자리에 작게
   reference 참고문헌 한 항목 — 옵션에 따라 원문 유지
@@ -44,6 +44,12 @@ FONT_BOLD = "NanumGothic-Bold.ttf"
 LINE_HEIGHT = 1.32        # 번역문 기본 줄간격 (한글은 1.3 안팎이 원문 쪽수에 맞추면서도 읽기 편함)
 FONT_BOOST = 1.08         # 같은 pt라도 한글이 작아 보여서 원문 본문 크기보다 조금 크게 시작
 MIN_SCALE = 0.72          # 페이지에 맞추려고 줄일 수 있는 하한 (본문 10pt → 약 7.2pt)
+MIN_BODY_PT = 8.0
+LAYOUT_VERSION = "page-owned-v2"
+
+
+class LayoutError(Exception):
+    """A page cannot be rendered legibly without losing its page ownership."""
 ITALIC_MIN_CHARS = 3      # 이 글자 수 미만의 이탤릭(M, SD, p, F, t 등 통계 기호)은 볼드 처리 안 함
 HEADER_ZONE = 72          # 페이지 위쪽 이 높이 안의 짧은 줄 = 러닝 헤더(쪽수, 저자명)
 FOOTER_ZONE = 40          # 페이지 아래쪽 이 높이 안의 짧은 줄 = 꼬리말
@@ -499,6 +505,9 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
     blocks: list[dict[str, Any]] = [
         {"kind": "figure", "bbox": r, "size": body, "html": "", "text": ""} for r in figs
     ]
+    for block in blocks:
+        labels = [line.strip() for line in page.get_textbox(block["bbox"]).splitlines() if line.strip()]
+        block["items"] = [esc(label) for label in labels]
 
     # 줄 단위로 먼저 읽는다 (선 없는 표를 찾으려면 블록을 가로질러 줄을 봐야 함)
     block_lines: list[tuple[pymupdf.Rect, list[dict]]] = []
@@ -607,7 +616,7 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
 
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
-    _carry_across_columns(ordered, page.rect)
+    # Keep each fragment in its original column.
     return {"mode": "text", "body_size": body, "blocks": _merge_headings(ordered)}
 
 
@@ -919,7 +928,7 @@ def extract_document(doc: pymupdf.Document) -> list[dict]:
         heads = [b for b in rest if b["kind"] == "header"]
         pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
     mark_references(pages)
-    carry_cross_page(pages)
+    # Keep each fragment on its original page, including range boundaries.
     _repeat_table_headers(pages)
     return pages
 
@@ -949,7 +958,10 @@ def translatable_units(pg: dict, translate_refs: bool = False,
     units: list[tuple[int, int | None, str]] = []
     for bi, b in enumerate(pg["blocks"]):
         k = b["kind"]
-        if k in ("header", "figure", "meta"):
+        if k in ("header", "meta"):
+            continue
+        if k == "figure":
+            units += [(bi, ii, h) for ii, h in enumerate(b.get("items", []))]
             continue
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
@@ -1064,6 +1076,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             if w > box_width - 4:                       # 단 폭보다 넓으면 비율 유지하며 줄인다
                 h, w = h * (box_width - 4) / w, box_width - 4
             out.append(f'<p class="fig"><img src="{b["img_name"]}" width="{w:.0f}" height="{h:.0f}"/></p>')
+            for source, translated in zip(b.get("items", []), b.get("tr_items", [])):
+                out.append(f'<p class="note">{source} → {to_reading_html(translated)}</p>')
     foot = [b for b in blocks if b["kind"] == "footnote"]
     if foot:
         out.append("<hr/>" + "".join(
@@ -1124,14 +1138,15 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
     font, lh = _fit(html, W, H, archive, pg["body_size"])
     page = out.new_page(width=W, height=H)
     if font is None:
-        # 가장 작은 글자로도 안 들어가는 극단적인 경우: 영역마다 따로 줄여서라도 이 쪽 안에 넣는다
-        for h, r in html:
-            page.insert_htmlbox(r, h, css=make_css(1.15) + f"body {{ font-size: {pg['body_size']:.1f}pt; }}",
-                                archive=archive, scale_low=0)
-    else:
-        css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
-        for h, r in html:
-            page.insert_htmlbox(r, h, css=css, archive=archive, scale_low=1)
+        out.delete_page(-1)
+        raise LayoutError(f"p.{pno}: 읽을 수 있는 최소 글자 크기로 내용을 담을 수 없습니다. "
+                          "번역문은 저장되어 있습니다. 이 페이지의 배치를 조정해야 합니다.")
+    css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
+    for h, r in html:
+        spare, scale = page.insert_htmlbox(r, h, css=css, archive=archive, scale_low=1)
+        if spare < 0 or scale < 1:
+            out.delete_page(-1)
+            raise LayoutError(f"p.{pno}: 최종 PDF 배치에 실패했습니다.")
     page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50), _label_html(label), css=CSS, archive=archive)
     return 1
 
@@ -1158,8 +1173,8 @@ def _fit(html: list[tuple[str, pymupdf.Rect]], W: float, H: float, archive: pymu
         trial.delete_page(-1)
         return ok
 
-    hi = body_size * FONT_BOOST
-    lo = body_size * 0.55
+    lo = max(MIN_BODY_PT, body_size * MIN_SCALE)
+    hi = max(lo, body_size * FONT_BOOST)
     tight = LINE_HEIGHTS[-1]
     if fits(hi, tight):
         font = hi
@@ -1244,6 +1259,8 @@ def page_text(pg: dict, translated: bool = True) -> str:
             continue
         if k == "figure":
             parts.append("[그림/표 — 원문 참조]" if translated else "[Figure/Table]")
+            items = b.get("tr_items", b.get("items", [])) if translated else b.get("items", [])
+            parts.extend(plain(t) for t in items)
         elif k == "list":
             items = (b.get("tr_items") or b["items"]) if translated else b["items"]
             parts.append("\n".join("• " + plain(t) for t in items))
@@ -1354,7 +1371,7 @@ def build_ocr_page(page: pymupdf.Page, ocr_blocks: list[dict], page_number: int)
 
 def apply_ocr(doc: pymupdf.Document, pages: list[dict], ocr: dict[str, list[dict]]) -> list[dict]:
     """스캔 쪽을 OCR 결과로 바꾼 새 페이지 목록 (원래 목록은 그대로 둔다).
-    OCR이 끝난 쪽끼리는 쪽 경계에서 끊긴 문장도 앞 쪽으로 모은다."""
+    OCR 문장 조각도 원래 페이지에 남긴다."""
     import copy
     out = copy.deepcopy(pages)
     changed = False
@@ -1362,8 +1379,12 @@ def apply_ocr(doc: pymupdf.Document, pages: list[dict], ocr: dict[str, list[dict
         if pg["mode"] == "scan" and str(pg["page_number"]) in ocr:
             out[i] = build_ocr_page(doc[i], ocr[str(pg["page_number"])], pg["page_number"])
             changed = True
-    if changed:
-        carry_cross_page(out)
+    for pg in out:
+        for bi, block in enumerate(pg["blocks"]):
+            key = f"figure:{pg['page_number']}:{bi}"
+            if block["kind"] == "figure" and key in ocr:
+                block["items"] = [esc(label) for label in ocr[key]]
+                block["labels_checked"] = True
     return out
 
 
