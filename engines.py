@@ -193,16 +193,25 @@ Rules — follow all of them strictly:
    "Shaughnessy, Garfield, and Greer (1996)" → "Shaughnessy, Garfield, Greer(1996)".
 5. <sup>n</sup> is a footnote number. Put it directly after the translated word or phrase that it
    follows in the source (e.g. "통계적 사고<sup>1</sup>"), never after an unrelated comma.
-6. Use a formal academic written style (for Korean: 평서체 "~이다/~한다").
+6. Use a formal academic written style (for Korean: 평서체 "~이다/~한다"). Write natural Korean
+   academic prose, not word-for-word translation: render English idioms and metaphors by their meaning
+   (e.g. "orthogonal to this work" → "이 연구와는 다른 차원의", "lens" → "관점" when used figuratively),
+   and split or reorder clauses when that reads more naturally — but never drop content.
+   Follow standard Korean spelling (대푯값, 최댓값, 최솟값, 극댓값).
 7. Use consistent terminology across segments. For statistics education terms prefer the Korean
    school-curriculum terms (data → 자료, measures of center → 대푯값,
    measures of spread/dispersion → 산포도, box-and-whisker plot → 상자그림).{glossary}
-8. A segment may be a heading, a list item, a figure/table caption, a footnote, a short note such as
-   an interview transcript line ("I:" interviewer, "S:" student), or a reference entry;
-   translate it as that kind of text."""
+8. A segment may be a heading, a list item, a figure/table caption, a footnote, a table cell, a
+   dialogue turn, or a reference entry; translate it as that kind of text.
+   - Dialogue turns ("Teacher: …", "Anna: …", "I: …", "S: …"): translate role labels
+     (Teacher → 교사, Interviewer/I → 면담자, Student/S → 학생, Researcher → 연구자), keep personal
+     names as they are (Anna → Anna), and translate the speech in natural spoken Korean
+     (교사는 해요체, 학생은 자연스러운 구어체), not in 평서체. Keep bracketed stage notes in brackets.
+   - Table cells: translate concisely; keep numbers, units and names unchanged.
+   - Author names, journal names and affiliations stay in their original language."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-06b"
+PROMPT_VERSION = "2026-10-06c"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:

@@ -18,7 +18,10 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
   footnote  각주 — 페이지 아래 구분선 밑에 배치
   note      본문 중간의 작은 글씨(그림 옆 면담 대화문 등) — 제자리에 작게
   reference 참고문헌 한 항목 — 옵션에 따라 원문 유지
-  table     가로로 돌려 놓은 표 (rotated_table.py) — 칸·항목 단위로 번역해 표로 다시 그림
+  table     표 — 가로로 돌려 놓은 표(rotated_table.py), 선 없는 글자 표(text_table.py).
+            칸·항목 단위로 번역해 표로 다시 그림
+  dialogue  면담·수업 대화문 ('Teacher: …') — 발화마다 한 줄
+  meta      첫 쪽의 학술지명·DOI — 번역하지 않고 작게 표시
 """
 from __future__ import annotations
 
@@ -30,13 +33,15 @@ from typing import Any
 import pymupdf
 
 import rotated_table
+import text_table
 
 # ─────────────────────────── 설정 ───────────────────────────
 FONT_DIR = Path(__file__).parent / "fonts"
 FONT_REGULAR = "NanumGothic-Regular.ttf"   # 다른 글꼴로 바꾸려면 fonts/에 넣고 파일명만 변경
 FONT_BOLD = "NanumGothic-Bold.ttf"
 
-LINE_HEIGHT = 1.55        # 번역문 기본 줄간격
+LINE_HEIGHT = 1.32        # 번역문 기본 줄간격 (한글은 1.3 안팎이 원문 쪽수에 맞추면서도 읽기 편함)
+FONT_BOOST = 1.08         # 같은 pt라도 한글이 작아 보여서 원문 본문 크기보다 조금 크게 시작
 MIN_SCALE = 0.72          # 페이지에 맞추려고 줄일 수 있는 하한 (본문 10pt → 약 7.2pt)
 ITALIC_MIN_CHARS = 3      # 이 글자 수 미만의 이탤릭(M, SD, p, F, t 등 통계 기호)은 볼드 처리 안 함
 HEADER_ZONE = 72          # 페이지 위쪽 이 높이 안의 짧은 줄 = 러닝 헤더(쪽수, 저자명)
@@ -50,6 +55,8 @@ SANS_FONTS = ("helvetica", "arial", "frutiger", "univers")  # run-in 소제목�
 PROTECT_RE = re.compile(
     r"(https?://\S+|www\.\S+|doi:\s*\S+|\b10\.\d{4,9}/\S+|[\w.+-]+@[\w-]+\.[\w.]+)"
 )
+SPEAKER_RE = re.compile(r"^(?:[A-Z][A-Za-z.\-’']{0,20}(?: [A-Z][A-Za-z.\-’']{0,20}){0,2})(?: \[[^\]]{1,30}\])?:\s")
+NUMBERED_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}\.?\s+[A-Z]")
 SENTENCE_END_RE = re.compile(r"[.?!:”\"’)\]]\s*$")
 CAPTION_RE = re.compile(r"^(FIGURE|Figure|Fig\.|TABLE|Table)\s*\d+", re.S)
 REF_HEAD_RE = re.compile(r"^(REFERENCES|References|Bibliography|BIBLIOGRAPHY|Works Cited|참고문헌)\s*$")
@@ -95,6 +102,35 @@ def body_size_of(page_dict: dict) -> float:
     return statistics.mode(sizes) if sizes else 10.0
 
 
+SYMBOL_FONT_RE = re.compile(r"(AdvP\d|AdvPi|Pi\d|Symbol|Dingbat|Wingding|ZapfDing|MathematicalPi|UniversalPi)", re.I)
+BOLD_NAME_RE = re.compile(r"(Bold|Black|Heavy|Semibold|Demi|\.B(?:I)?(?:\+\d+)?$|-B$)", re.I)
+ITALIC_NAME_RE = re.compile(r"(Italic|Oblique|\.(?:B)?I(?:\+\d+)?$|-It$)", re.I)
+
+
+def _is_bold(sp: dict) -> bool:
+    return bool(sp["flags"] & 16) or bool(BOLD_NAME_RE.search(sp["font"]))
+
+
+def _is_italic(sp: dict) -> bool:
+    return bool(sp["flags"] & ITALIC_FLAG) or bool(ITALIC_NAME_RE.search(sp["font"]))
+
+
+def _fix_symbol(t: str, sp: dict, first: bool) -> str:
+    """기호 글꼴(Springer의 AdvP… 등)은 글자 코드가 엉뚱하게 잡힌다: • → '&', © → '#', · → ':'.
+    위첨자로 올린 '.'도 주제어 구분점(·)이다."""
+    core = t.strip()
+    if SYMBOL_FONT_RE.search(sp["font"]):
+        if core == "&":
+            return t.replace("&", "•" if first else "·")
+        if core == "#":
+            return t.replace("#", "©")
+        if core == ":":
+            return t.replace(":", " ·")
+    if core == "." and sp["flags"] & 1:
+        return t.replace(".", " ·")
+    return t
+
+
 def _line(line: dict, body: float, mixed: bool = True) -> dict:
     """한 줄 → {html, text, x0, size, sans}. 이탤릭은 <i>, 위첨자 각주번호는 <sup>.
     mixed: 블록 안에 본문 글꼴(세리프)이 섞여 있는지. 블록 전체가 산세리프면(면담 대화문,
@@ -108,18 +144,26 @@ def _line(line: dict, body: float, mixed: bool = True) -> dict:
     def is_sans(sp: dict) -> bool:
         return any(f in sp["font"].lower() for f in SANS_FONTS)
 
+    sizes: list[float] = []
+    seen_text = False
     for idx, s in enumerate(line["spans"]):
         t = _span_text(s, s["size"])
         if not t:
             continue
+        t = _fix_symbol(t, s, first=not seen_text)
+        seen_text = seen_text or bool(t.strip())
         max_size = max(max_size, s["size"])
+        if not SYMBOL_FONT_RE.search(s["font"]):
+            sizes += [s["size"]] * len(t.strip())
         e = esc(t)
+        lead = e[: len(e) - len(e.lstrip())]
         is_sup = s["size"] < body * 0.8 and s["bbox"][3] < base_y - 1 and t.strip().isdigit()
         if is_sup:
             e = f"<sup>{e.strip()}</sup>"
-        elif s["flags"] & ITALIC_FLAG and len(t.strip()) >= ITALIC_MIN_CHARS:
-            lead = e[: len(e) - len(e.lstrip())]
+        elif _is_italic(s) and len(t.strip()) >= ITALIC_MIN_CHARS:
             e = f"{lead}<i>{e.strip()}</i>"
+        elif _is_bold(s) and len(t.strip()) >= 2 and mixed:
+            e = f"{lead}<b>{e.strip()}</b>"
         elif idx == 0 and is_sans(s) and t.strip():
             # 본문과 다른 산세리프로 시작 → 'Describing data.' 같은 run-in 소제목
             sans = t
@@ -127,9 +171,12 @@ def _line(line: dict, body: float, mixed: bool = True) -> dict:
                 e = f"<b>{e}</b>"
         html_parts.append(e)
         plain_parts.append(t)
+    main_size = statistics.median(sizes) if sizes else max_size
     return {"html": "".join(html_parts), "text": "".join(plain_parts),
-            "x0": line["bbox"][0], "y0": line["bbox"][1], "size": max_size, "sans": sans,
-            "bold": all(sp["flags"] & 16 for sp in line["spans"] if _span_text(sp, sp["size"]).strip())}
+            "x0": line["bbox"][0], "y0": line["bbox"][1], "size": main_size, "sans": sans,
+            "bbox": pymupdf.Rect(line["bbox"]),
+            "bold": all(_is_bold(sp) for sp in line["spans"]
+                        if _span_text(sp, sp["size"]).strip() and not SYMBOL_FONT_RE.search(sp["font"]))}
 
 
 def _drop_trailing_hyphen(html: str) -> str:
@@ -152,7 +199,7 @@ def join_lines(lines: list[dict]) -> tuple[str, str]:
             plain += " "
         html += h
         plain += p
-    for t in ("i", "b"):                        # 줄마다 나뉜 태그를 하나로
+    for t in ("i", "b", "u"):                   # 줄마다 나뉜 태그를 하나로
         html = html.replace(f"</{t}><{t}>", "")
         html = re.sub(rf"</{t}>\s+<{t}>", " ", html)
     return html, plain
@@ -233,17 +280,41 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         {"kind": "figure", "bbox": r, "size": body, "html": "", "text": ""} for r in figs
     ]
 
+    # 줄 단위로 먼저 읽는다 (선 없는 표를 찾으려면 블록을 가로질러 줄을 봐야 함)
+    block_lines: list[tuple[pymupdf.Rect, list[dict]]] = []
     for b in raw["blocks"]:
         if b["type"] != 0:
             continue
-        bbox = pymupdf.Rect(b["bbox"])
         mixed = any(not any(f in sp["font"].lower() for f in SANS_FONTS)
                     for l in b["lines"] for sp in l["spans"]
                     if "".join(c["c"] for c in sp["chars"]).strip())
         lines = [_line(l, body, mixed) for l in b["lines"] if abs(l["dir"][0] - 1) < 0.01]
         lines = [x for x in lines if x["text"].strip()]
-        if not lines:
-            continue
+        for x in lines:
+            x["id"] = id(x)
+        if lines:
+            block_lines.append((pymupdf.Rect(b["bbox"]), lines))
+
+    def in_fig(r: pymupdf.Rect) -> bool:
+        c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+        return any(f.contains(c) for f in figs)
+
+    try:
+        tables = text_table.find_text_tables(
+            [l for _, ls in block_lines for l in ls if not in_fig(l["bbox"])], page.rect)
+    except Exception:
+        tables = []
+    table_ids = {i for t in tables for i in t.pop("line_ids")}
+    blocks += tables
+
+    for bbox, lines in block_lines:
+        if table_ids:
+            lines = [l for l in lines if l["id"] not in table_ids]
+            if not lines:
+                continue
+            bbox = pymupdf.Rect(lines[0]["bbox"])
+            for l in lines[1:]:
+                bbox |= l["bbox"]
         plain_all = " ".join(x["text"].strip() for x in lines)
 
         # 그림 영역 안의 글자(축 이름, 범례, 표 칸)는 그림의 일부 → 번역하지 않는다.
@@ -252,8 +323,22 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         if any(f.contains(center) for f in figs) and not CAPTION_RE.match(plain_all):
             continue
 
-        size = max(x["size"] for x in lines)
+        # 블록 글자 크기 = 줄들의 대표 크기 (기호 하나가 크다고 제목이 되지 않게)
+        size = statistics.median(x["size"] for x in lines)
         plains = [x["text"].strip() for x in lines]
+
+        # 대화문: 'Teacher: …', 'Anna: …'처럼 화자 이름으로 시작하는 줄이 여럿이면 한 줄씩 나눈다
+        if sum(bool(SPEAKER_RE.match(p)) for p in plains) >= 2:
+            turns: list[list[dict]] = []
+            for ln in lines:
+                if SPEAKER_RE.match(ln["text"].strip()) or not turns:
+                    turns.append([])
+                turns[-1].append(ln)
+            joined = [join_lines(t) for t in turns]
+            blocks.append({"kind": "dialogue", "bbox": bbox, "size": size,
+                           "items": [_protect(h) for h, _ in joined],
+                           "html": "", "text": "\n".join(p for _, p in joined)})
+            continue
 
         # 글머리표 목록: 한 블록 안에 '•'로 시작하는 줄이 여럿
         if sum(p.startswith(BULLETS) for p in plains) >= 2:
@@ -282,13 +367,14 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
             kind = "heading"            # 큰 글씨 = 제목 (문장부호로 끝나도)
         elif len(plain) < 80 and not SENTENCE_END_RE.search(plain) and (
             plain.isupper() or lines[0]["sans"].strip() == plain or all(l.get("bold") for l in lines)
+            or NUMBERED_HEADING_RE.match(plain)
         ):
             kind = "heading"
         centered = (abs((bbox.x0 + bbox.x1) / 2 - page.rect.width / 2) < 15
                     and bbox.width < page.rect.width * 0.7 and len(plain) < 120)
         blocks.append({"kind": kind, "bbox": bbox, "size": size, "html": _protect(html),
                        "text": plain, "lines": lines, "centered": centered,
-                       "title": kind == "heading" and size > body * 1.4})
+                       "title": kind == "heading" and size > body * 1.3})
 
     # 작은 글씨라도 그 아래에 본문 문단이 있으면 각주가 아니다 (그림 옆 대화문, 표 주석 등)
     body_tops = [b["bbox"].y0 for b in blocks if b["kind"] == "para" and b["size"] >= body * 0.95]
@@ -504,6 +590,14 @@ def extract_document(doc: pymupdf.Document) -> list[dict]:
             pg = {"mode": "error", "body_size": 10.0, "blocks": [], "error": str(e)}
         pg["page_number"] = i + 1
         pages.append(pg)
+    if pages and pages[0]["mode"] == "text":
+        for b in pages[0]["blocks"]:
+            if b["kind"] == "header" and re.search(r"(doi|DOI|\d{4}\)?\s*\d+[:(]|Vol\.|ISSN)", b["text"]):
+                b["kind"] = "meta"
+        metas = [b for b in pages[0]["blocks"] if b["kind"] == "meta"]
+        rest = [b for b in pages[0]["blocks"] if b["kind"] != "meta"]
+        heads = [b for b in rest if b["kind"] == "header"]
+        pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
     mark_references(pages)
     carry_cross_page(pages)
     _repeat_table_headers(pages)
@@ -535,11 +629,11 @@ def translatable_units(pg: dict, translate_refs: bool = False,
     units: list[tuple[int, int | None, str]] = []
     for bi, b in enumerate(pg["blocks"]):
         k = b["kind"]
-        if k in ("header", "figure"):
+        if k in ("header", "figure", "meta"):
             continue
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
-        if k in ("list", "table"):
+        if k in ("list", "table", "dialogue"):
             units += [(bi, ii, h) for ii, h in enumerate(b["items"])]
         elif b["html"].strip():
             units.append((bi, None, b["html"]))
@@ -562,7 +656,7 @@ CSS = f"""
 @font-face {{ font-family: kr; src: url({FONT_BOLD}); font-weight: bold; }}
 * {{ font-family: kr; }}
 body {{ color: #1a1a1a; }}
-p {{ margin: 0 0 0.45em 0; line-height: {LINE_HEIGHT}; text-align: left; }}
+p {{ margin: 0 0 0.4em 0; line-height: {LINE_HEIGHT}; text-align: left; }}
 p.para {{ text-indent: 1em; }}
 p.center {{ text-align: center; }}
 h1 {{ font-size: 1.5em; font-weight: bold; text-align: center; line-height: 1.35; margin: 0.4em 0 0.8em 0; }}
@@ -574,6 +668,8 @@ b {{ font-weight: bold; }}
 sup {{ font-size: 0.7em; }}
 .cap {{ font-size: 0.85em; text-align: center; margin: 0.2em 0 0.7em 0; }}
 .fig {{ text-align: center; margin: 0.3em 0 0.2em 0; }}
+.dlg {{ margin: 0 1.2em 0.2em 1.2em; padding-left: 1.2em; text-indent: -1.2em; }}
+.meta {{ font-size: 0.75em; color: #666; line-height: 1.35; margin: 0 0 0.6em 0; }}
 .note {{ font-size: 0.85em; line-height: 1.45; margin: 0 0 0.25em 1.5em; }}
 .fn {{ font-size: 0.8em; line-height: 1.45; color: #333; }}
 .ref {{ font-size: 0.8em; line-height: 1.4; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
@@ -628,6 +724,11 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             out.append(f'<p class="note">{to_reading_html(tr)}</p>')
         elif k == "table":
             out += rotated_table.table_pieces(b, to_reading_html, box_width)
+        elif k == "dialogue":
+            items = b.get("tr_items") or b["items"]
+            out.append("".join(f'<p class="dlg">{to_reading_html(t)}</p>' for t in items))
+        elif k == "meta":
+            out.append(f'<p class="meta">{to_reading_html(b["html"])}</p>')
         elif k == "reference":
             # 참고문헌은 학술지명 이탤릭을 볼드로 바꾸지 않는다 (지저분해짐)
             out.append(f'<p class="ref">{to_reading_html(tr, italic_to_bold=False)}</p>')
@@ -678,9 +779,10 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
 
     blocks = pg["blocks"]
     rects = [b["bbox"] for b in blocks if b["kind"] != "header" and not b["bbox"].is_empty] or [src.rect]
-    left = max(min(r.x0 for r in rects) - 4, 30)
-    right = min(max(r.x1 for r in rects) + 4, W - 30)
-    box = pymupdf.Rect(left, HEADER_ZONE - 10, right, H - 36)
+    # 한국어는 영어보다 길어지므로 원문 본문 폭보다 조금 넓게(좌우 여백 34pt까지) 쓴다
+    left = min(min(r.x0 for r in rects) - 4, 34)
+    right = max(max(r.x1 for r in rects) + 4, W - 34)
+    box = pymupdf.Rect(max(left, 24), 52, min(right, W - 24), H - 30)
 
     for b in blocks:                           # 그림은 원문에서 잘라 PNG로
         if b["kind"] == "figure":
@@ -690,7 +792,7 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
             b["img_name"] = name
 
     pieces = _pieces(blocks, box.width) or ['<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>']
-    css = CSS + f"body {{ font-size: {pg['body_size']:.1f}pt; }}"
+    css = CSS + f"body {{ font-size: {pg['body_size'] * FONT_BOOST:.1f}pt; }}"
     added = 0
     while pieces:
         # 남은 조각을 최대한 많이 담을 수 있는 개수 찾기 (전부 → 하나씩 줄이기)
@@ -730,6 +832,9 @@ def page_text(pg: dict, translated: bool = True) -> str:
         elif k == "list":
             items = (b.get("tr_items") or b["items"]) if translated else b["items"]
             parts.append("\n".join("• " + plain(t) for t in items))
+        elif k == "dialogue":
+            items = (b.get("tr_items") or b["items"]) if translated else b["items"]
+            parts.append("\n".join(plain(t) for t in items))
         elif k == "table":
             items = (b.get("tr_items") or b["items"]) if translated else b["items"]
             lay = b["layout"]
