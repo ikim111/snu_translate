@@ -169,11 +169,6 @@ with st.sidebar:
     interleave = st.checkbox("원문 페이지 함께 넣기", value=False,
                              help="원문 1쪽 → 번역 1쪽 순서로 번갈아 넣습니다.")
 
-    st.header("용어집")
-    glossary_text = st.text_area("영어 = 한국어 (한 줄에 하나)", value=DEFAULT_GLOSSARY, height=120,
-                                 help="같은 용어를 논문 전체에서 같은 번역어로 맞춥니다. 한국어 번역에만 적용됩니다.")
-
-
 def parse_glossary(text: str) -> dict[str, str]:
     entries: dict[str, str] = {}
     for line in text.splitlines():
@@ -182,6 +177,35 @@ def parse_glossary(text: str) -> dict[str, str]:
             if en and ko:
                 entries[en] = ko
     return entries
+
+
+def glossary_to_text(entries: dict[str, str]) -> str:
+    return "\n".join(f"{k} = {v}" for k, v in entries.items())
+
+
+# 용어집: 서재에 저장된 것이 있으면 그걸로 시작 (없으면 기본값)
+if "glossary_text" not in st.session_state:
+    saved = None
+    if lib is not None:
+        try:
+            saved = lib.get_glossary()
+        except library.LibraryError:
+            saved = None
+    st.session_state.glossary_text = glossary_to_text(saved) if saved else DEFAULT_GLOSSARY
+if "glossary_pending" in st.session_state:        # 추천 용어를 확정했을 때 (위젯 그리기 전에 반영)
+    st.session_state.glossary_text = st.session_state.pop("glossary_pending")
+
+with st.sidebar:
+    st.header("용어집")
+    glossary_text = st.text_area("영어 = 한국어 (한 줄에 하나)", key="glossary_text", height=160,
+                                 help="같은 용어를 논문 전체에서 같은 번역어로 맞춥니다. 한국어 번역에만 적용됩니다. "
+                                      "용어집을 바꾸면 같은 논문도 다시 번역합니다.")
+    if lib is not None and st.button("💾 용어집 서재에 저장", width="stretch"):
+        try:
+            lib.save_glossary(parse_glossary(glossary_text))
+            st.success("저장했습니다. 다음에 앱을 열 때도 이 용어집으로 시작합니다.")
+        except library.LibraryError as e:
+            st.error(str(e))
 
 
 glossary_entries = parse_glossary(glossary_text) if target == "KO" else {}
@@ -307,6 +331,67 @@ if engine_name == "OpenAI":
 else:
     cost = " (DeepL 남은 한도는 번역 시작 시 확인해 보여 줍니다)"
 st.info(f"선택 범위 {len(sel)}쪽 중 {done_in_range}쪽 번역 완료 · 남은 원문 약 {need_chars:,}자{cost}")
+
+# ─────────────────────────── 용어 추천 ───────────────────────────
+def paper_text_for_terms() -> str:
+    """참고문헌을 뺀 본문 텍스트 (용어 추천용)."""
+    parts = []
+    for pg in pages:
+        for b in pg["blocks"]:
+            if b["kind"] in ("para", "heading", "caption", "list", "note", "table", "footnote"):
+                parts.append(b["text"])
+    return "\n".join(parts)
+
+
+with st.expander("📖 이 논문의 용어 추천받기", expanded=False):
+    st.caption("OpenAI가 이 논문에서 반복되는 핵심 용어와 번역어를 제안합니다. 확인·수정 후 확정하면 용어집에 추가되고"
+               + (" 서재에 저장되어 다음 논문에도 쓰입니다." if lib is not None else "니다.")
+               + " 번역 전에 해 두세요.")
+    openai_key = api_key if engine_name == "OpenAI" else secret("OPENAI_API_KEY")
+    term_model = model if engine_name == "OpenAI" else engines.DEFAULT_OPENAI_MODEL \
+        if hasattr(engines, "DEFAULT_OPENAI_MODEL") else list(engines.OPENAI_MODELS)[0]
+    if st.button("용어 추천받기", disabled=not openai_key):
+        with st.spinner("논문을 읽고 용어를 고르는 중… (30초~1분)"):
+            try:
+                text = paper_text_for_terms()
+                sugg = engines.suggest_terms(openai_key, term_model, text, parse_glossary(glossary_text))
+                low = text.lower()
+                for t in sugg:
+                    t["count"] = low.count(t["en"].lower())
+                sugg = [t for t in sugg if t["count"] >= 2] or sugg
+                st.session_state.term_suggestions = (pdf_hash, sorted(sugg, key=lambda t: -t["count"]))
+            except engines.EngineError as e:
+                st.error(str(e))
+    if not openai_key:
+        st.caption("OpenAI API Key가 필요합니다.")
+
+    sug = st.session_state.get("term_suggestions")
+    if sug and sug[0] == pdf_hash:
+        import pandas as pd
+        df = pd.DataFrame([{"추가": True, "영어": t["en"], "한국어": t["ko"], "등장": t["count"], "설명": t["why"]}
+                           for t in sug[1]])
+        edited = st.data_editor(
+            df, hide_index=True, width="stretch", key=f"terms_{pdf_hash[:8]}",
+            column_config={
+                "추가": st.column_config.CheckboxColumn(width="small"),
+                "영어": st.column_config.TextColumn(disabled=True),
+                "한국어": st.column_config.TextColumn(help="눌러서 고칠 수 있습니다"),
+                "등장": st.column_config.NumberColumn(disabled=True, width="small"),
+                "설명": st.column_config.TextColumn(disabled=True),
+            })
+        if st.button("✅ 선택한 용어 확정", type="primary"):
+            merged = parse_glossary(glossary_text)
+            for _, row in edited.iterrows():
+                if row["추가"] and str(row["한국어"]).strip():
+                    merged[str(row["영어"]).strip()] = str(row["한국어"]).strip()
+            st.session_state.glossary_pending = glossary_to_text(merged)
+            st.session_state.pop("term_suggestions", None)
+            if lib is not None:
+                try:
+                    lib.save_glossary(merged)
+                except library.LibraryError as e:
+                    st.error(f"용어집을 서재에 저장하지 못했습니다: {e}")
+            st.rerun()
 
 with st.expander("이전 진행 상황 불러오기 / 저장하기"):
     st.caption("앱이 재시작되면 서버의 캐시가 사라질 수 있습니다. 진행 파일을 받아 두었다가 올리면 이어서 번역합니다.")

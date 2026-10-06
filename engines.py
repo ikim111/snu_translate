@@ -299,3 +299,69 @@ def openai_cost_krw(model: str, src_chars: int) -> int | None:
     tokens_out = src_chars * 0.4             # 한국어 번역문 (대략)
     usd = tokens_in / 1e6 * pin + tokens_out / 1e6 * pout
     return round(usd * USD_KRW)
+
+
+# ─────────────────────────── 용어 추천 (OpenAI) ───────────────────────────
+TERM_PROMPT = """You help a Korean graduate student in mathematics education read an English research paper.
+From the paper text, pick up to {n} technical terms or key phrases that appear repeatedly and whose Korean
+translation should stay consistent throughout the paper: concepts, constructs, names of frameworks, levels,
+processes and categories, and method terms. Skip ordinary words, author names, statistics symbols, and every
+term already in the existing glossary.
+For each term give the most standard Korean translation used in Korean mathematics education research.
+Prefer Korean school-curriculum terms where they exist (data → 자료, measures of center → 대푯값,
+measures of spread → 산포도, box plot → 상자그림). Keep the English term exactly as it appears in the
+paper (lowercase unless it is a proper name). In "why", explain in one short Korean sentence what the term
+means in this paper.
+
+Existing glossary (do not repeat these):
+{existing}"""
+
+
+def suggest_terms(api_key: str, model: str, paper_text: str, existing: dict[str, str],
+                  n: int = 25) -> list[dict[str, str]]:
+    """논문에서 용어집에 넣을 만한 용어와 번역어를 추천받는다. [{en, ko, why}]"""
+    import openai
+
+    client = openai.OpenAI(api_key=api_key.strip(), max_retries=3, timeout=180)
+    schema = {
+        "type": "object",
+        "properties": {"terms": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"en": {"type": "string"}, "ko": {"type": "string"}, "why": {"type": "string"}},
+            "required": ["en", "ko", "why"], "additionalProperties": False}}},
+        "required": ["terms"], "additionalProperties": False,
+    }
+    existing_txt = "\n".join(f"- {k} = {v}" for k, v in existing.items()) or "(none)"
+    kw: dict[str, Any] = dict(
+        model=model,
+        instructions=TERM_PROMPT.format(n=n, existing=existing_txt),
+        input=paper_text[:60_000],
+        text={"format": {"type": "json_schema", "name": "terms", "schema": schema, "strict": True}},
+    )
+    try:
+        try:
+            resp = client.responses.create(reasoning={"effort": "low"}, **kw)
+        except openai.BadRequestError as e:
+            if "reasoning" not in str(e):
+                raise
+            resp = client.responses.create(**kw)
+        terms = json.loads(resp.output_text)["terms"]
+    except openai.AuthenticationError:
+        raise EngineError("API Key 오류: OpenAI 키가 올바르지 않습니다.", fatal=True)
+    except openai.RateLimitError as e:
+        if "insufficient_quota" in str(e):
+            raise EngineError("OpenAI 크레딧 부족: platform.openai.com에서 충전하세요.", fatal=True)
+        raise EngineError("요청이 너무 많음 — 잠시 후 다시 시도하세요.")
+    except openai.OpenAIError as e:
+        raise EngineError(f"용어 추천 실패: {e}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise EngineError(f"용어 추천 결과 형식 오류: {e}")
+
+    have = {k.lower() for k in existing}
+    out, seen = [], set()
+    for t in terms:
+        en, ko = t.get("en", "").strip(), t.get("ko", "").strip()
+        if en and ko and en.lower() not in have and en.lower() not in seen:
+            seen.add(en.lower())
+            out.append({"en": en, "ko": ko, "why": t.get("why", "").strip()})
+    return out

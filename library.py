@@ -14,6 +14,7 @@ Streamlit Community Cloud의 디스크는 앱이 잠들거나 다시 배포되�
     papers/<paper_id>/translation.pdf
     papers/<paper_id>/original.pdf   원문 (나중에 번역비 없이 PDF를 다시 만들 때 필요)
     papers/<paper_id>/progress.json  번역 데이터 (앱의 '진행 파일'과 같은 형식)
+    glossary.json                    내 용어집 {영어: 한국어}
 
 paper_id는 원문 PDF의 해시 앞 16자라서, 같은 논문은 항상 같은 자리에 덮어쓴다.
 """
@@ -130,3 +131,19 @@ class Library:
             self.remove(f"papers/{pid}/{name}", f"삭제: {pid}/{name}")
         items = [m for m in self.list_papers() if m.get("id") != pid]
         self._save_index(items, f"서재 목록에서 삭제: {pid}")
+
+    # ── 용어집 ──
+    def get_glossary(self) -> dict[str, str] | None:
+        raw = self.read("glossary.json")
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            return None
+
+    def save_glossary(self, entries: dict[str, str]) -> None:
+        ordered = dict(sorted(entries.items(), key=lambda kv: kv[0].lower()))
+        self.write("glossary.json", json.dumps(ordered, ensure_ascii=False, indent=1).encode("utf-8"),
+                   f"용어집 갱신 ({len(ordered)}개)")
