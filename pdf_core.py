@@ -128,7 +128,8 @@ def _line(line: dict, body: float, mixed: bool = True) -> dict:
         html_parts.append(e)
         plain_parts.append(t)
     return {"html": "".join(html_parts), "text": "".join(plain_parts),
-            "x0": line["bbox"][0], "y0": line["bbox"][1], "size": max_size, "sans": sans}
+            "x0": line["bbox"][0], "y0": line["bbox"][1], "size": max_size, "sans": sans,
+            "bold": all(sp["flags"] & 16 for sp in line["spans"] if _span_text(sp, sp["size"]).strip())}
 
 
 def _drop_trailing_hyphen(html: str) -> str:
@@ -280,7 +281,7 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         elif len(plain) < 120 and size > body * 1.15:
             kind = "heading"            # 큰 글씨 = 제목 (문장부호로 끝나도)
         elif len(plain) < 80 and not SENTENCE_END_RE.search(plain) and (
-            plain.isupper() or lines[0]["sans"].strip() == plain
+            plain.isupper() or lines[0]["sans"].strip() == plain or all(l.get("bold") for l in lines)
         ):
             kind = "heading"
         centered = (abs((bbox.x0 + bbox.x1) / 2 - page.rect.width / 2) < 15
@@ -403,9 +404,13 @@ def mark_references(pages: list[dict]) -> None:
             if not ref_lines:
                 return
             margin = min(l["x0"] for l in ref_lines)
+            # 번호식 참고문헌([1] … / 1. …)이면 번호로 시작하는 줄에서만 새 항목
+            numbered_style = sum(bool(re.match(r"^\s*(\[\d+\]|\d+\.)\s", l["text"])) for l in ref_lines) \
+                >= max(3, len(ref_lines) // 4)
             entries: list[list[dict]] = []
             for ln in ref_lines:
-                if ln["x0"] <= margin + 3 or not entries:
+                numbered = re.match(r"^\s*(\[\d+\]|\d+\.)\s", ln["text"])
+                if ln["x0"] <= margin + 3 and (not numbered_style or numbered) or not entries:
                     entries.append([])
                 entries[-1].append(ln)
             for e in entries:
@@ -415,14 +420,15 @@ def mark_references(pages: list[dict]) -> None:
             ref_lines.clear()
 
         for b in pg["blocks"]:
-            if b["kind"] == "heading" and REF_HEAD_RE.match(b["text"].strip()):
+            if b["kind"] in ("heading", "para", "note") and REF_HEAD_RE.match(b["text"].strip()):
+                b["kind"] = "heading"
                 in_refs = True
                 new_blocks.append(b)
                 continue
             if b["kind"] == "heading" and END_REF_RE.match(b["text"].strip()):
                 flush()
                 in_refs = False
-            if in_refs and b["kind"] in ("para", "footnote") and b.get("lines"):
+            if in_refs and b["kind"] in ("para", "footnote", "note", "list") and b.get("lines"):
                 ref_lines.extend(b["lines"])
                 continue
             flush()
