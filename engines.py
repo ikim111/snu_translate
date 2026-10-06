@@ -28,6 +28,7 @@ OPENAI_MODELS: dict[str, tuple[str, float, float]] = {
     "gpt-6-luna": ("저렴·빠름", 0.10, 0.50),
     "gpt-6.1-sol": ("고품질", 2.00, 10.00),
 }
+DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"   # 앱을 열었을 때 기본으로 선택되는 모델
 USD_KRW = 1400            # 비용 안내용 대략 환율
 
 
