@@ -1,0 +1,3 @@
+streamlit>=1.40
+pymupdf>=1.26
+deepl>=1.20
