@@ -13,6 +13,7 @@ app.py는 엔진 종류를 몰라도 되게, 두 엔진 모두 같은 모양으�
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -374,3 +375,92 @@ def suggest_terms(api_key: str, model: str, paper_text: str, existing: dict[str,
             seen.add(en.lower())
             out.append({"en": en, "ko": ko, "why": t.get("why", "").strip()})
     return out
+
+
+# ─────────────────────────── 스캔 쪽 글자 읽기 (OCR) ───────────────────────────
+OCR_PROMPT = """You are transcribing one scanned page of an English academic paper so it can be translated.
+Return every piece of text on the page as blocks in correct reading order (for two-column pages:
+full-width items at the top, then the whole left column, then the whole right column, then footnotes).
+
+Block kinds:
+- header: running head, page number, journal line at the very top or bottom
+- title: the paper title (first page only); heading: section or subsection headings
+- para: a normal paragraph (one block per paragraph, even if it is long)
+- list_item: one bulleted or numbered item
+- caption: "Figure n …" / "Table n …" captions
+- figure: a graph, diagram, photo or drawing region (text = ""); give its bbox carefully
+- table: a table; put its cells in "rows" (first row = column headings), text = ""
+- dialogue: interview or classroom talk; text = all turns of one exchange, one turn per line ("I: …\nS: …")
+- note: other small text (e.g. a note under a table)
+- footnote: footnotes at the bottom
+- reference: one entry of the reference list
+
+Rules:
+- Transcribe exactly. Do not translate, summarize, correct or skip anything.
+- Join words that were hyphenated across a line break; join lines of a paragraph with spaces.
+- Mark italic text with <i>…</i>, bold text with <b>…</b>, and superscript footnote numbers with <sup>…</sup>.
+  Use no other markup.
+- bbox = [x0, y0, x1, y1] as fractions (0–1) of the page width and height.
+- If a paragraph continues from the previous page or onto the next page, still give it as a para.
+- "rows" must be [] for every kind except table."""
+
+OCR_SCHEMA = {
+    "type": "object",
+    "properties": {"blocks": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["header", "title", "heading", "para", "list_item", "caption",
+                                                 "figure", "table", "dialogue", "note", "footnote", "reference"]},
+            "text": {"type": "string"},
+            "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+            "bbox": {"type": "array", "items": {"type": "number"}},
+        },
+        "required": ["kind", "text", "rows", "bbox"], "additionalProperties": False}}},
+    "required": ["blocks"], "additionalProperties": False,
+}
+
+OCR_DPI = 150
+
+
+def ocr_page(api_key: str, model: str, png: bytes) -> list[dict]:
+    """스캔 쪽 이미지(PNG) → 블록 목록 [{kind, text, rows, bbox}]."""
+    import openai
+
+    client = openai.OpenAI(api_key=api_key.strip(), max_retries=3, timeout=240)
+    url = "data:image/png;base64," + base64.b64encode(png).decode()
+    kw: dict[str, Any] = dict(
+        model=model,
+        instructions=OCR_PROMPT,
+        input=[{"role": "user", "content": [
+            {"type": "input_text", "text": "Transcribe this page."},
+            {"type": "input_image", "image_url": url, "detail": "high"},
+        ]}],
+        text={"format": {"type": "json_schema", "name": "page", "schema": OCR_SCHEMA, "strict": True}},
+    )
+    try:
+        try:
+            resp = client.responses.create(reasoning={"effort": "low"}, **kw)
+        except openai.BadRequestError as e:
+            if "reasoning" not in str(e):
+                raise
+            resp = client.responses.create(**kw)
+        return json.loads(resp.output_text)["blocks"]
+    except openai.AuthenticationError:
+        raise EngineError("API Key 오류: OpenAI 키가 올바르지 않습니다.", fatal=True)
+    except openai.RateLimitError as e:
+        if "insufficient_quota" in str(e):
+            raise EngineError("OpenAI 크레딧 부족: platform.openai.com에서 충전하세요.", fatal=True)
+        raise EngineError("요청이 너무 많음 — 잠시 후 다시 시도하세요.")
+    except openai.OpenAIError as e:
+        raise EngineError(f"글자 읽기 실패: {e}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise EngineError(f"글자 읽기 결과 형식 오류: {e}")
+
+
+def ocr_cost_krw(model: str, n_pages: int) -> int | None:
+    """쪽당 이미지 입력 약 2,000토큰 + 출력 약 1,500토큰으로 거칠게 추정."""
+    if model not in OPENAI_MODELS:
+        return None
+    _, pin, pout = OPENAI_MODELS[model]
+    usd = n_pages * (2_500 / 1e6 * pin + 1_500 / 1e6 * pout)
+    return round(usd * USD_KRW)

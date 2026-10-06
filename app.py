@@ -250,23 +250,92 @@ except Exception as e:
     st.error(f"PDF를 열 수 없습니다: {e}")
     st.stop()
 
+paper_id = pdf_hash[:16]
 if st.session_state.get("pdf_hash") != pdf_hash:
     with st.spinner("PDF 구조 분석 중…"):
-        st.session_state.pages = core.extract_document(src)
+        st.session_state.base_pages = core.extract_document(src)
     st.session_state.pdf_hash = pdf_hash
     st.session_state.pop("built", None)
+    st.session_state.pop("pages_ocr_sig", None)
+    # 스캔 쪽 글자 읽기(OCR) 결과: 서버 캐시 → 서재 순으로 찾는다
+    ocr: dict[str, Any] = load_cache(f"ocr_{paper_id}")
+    if not ocr and lib is not None and any(pg["mode"] == "scan" for pg in st.session_state.base_pages):
+        try:
+            raw = lib.get_file(paper_id, "ocr.json")
+            if raw:
+                ocr = json.loads(raw.decode("utf-8"))
+                save_cache(f"ocr_{paper_id}", ocr)
+        except (library.LibraryError, ValueError):
+            pass
+    st.session_state.ocr = ocr
+ocr_data: dict[str, Any] = st.session_state.ocr
+base_pages: list[dict] = st.session_state.base_pages
+ocr_sig = (pdf_hash, tuple(sorted(ocr_data)))
+if st.session_state.get("pages_ocr_sig") != ocr_sig:
+    st.session_state.pages = core.apply_ocr(src, base_pages, ocr_data) if ocr_data else base_pages
+    st.session_state.pages_ocr_sig = ocr_sig
 pages: list[dict] = st.session_state.pages
 
 n_pages = src.page_count
 text_chars = sum(len(b["text"]) for pg in pages for b in pg["blocks"])
+scan_pages = [pg for pg in pages if pg["mode"] == "scan"]
 c1, c2, c3 = st.columns(3)
 c1.metric("파일", uploaded.name[:28] + ("…" if len(uploaded.name) > 28 else ""))
 c2.metric("전체 페이지", n_pages)
 c3.metric("추출된 글자 수", f"{text_chars:,}")
 
-if text_chars < 50 * n_pages:
-    st.error("텍스트가 거의 없습니다. 스캔된 PDF로 보입니다. 이 버전은 OCR을 지원하지 않습니다.")
+if text_chars < 50 * n_pages and not scan_pages and not ocr_data:
+    st.error("텍스트가 거의 없습니다. 글자를 읽을 수 없는 PDF입니다.")
     st.stop()
+
+# ─────────────────────────── 스캔 쪽 글자 읽기 (OCR) ───────────────────────────
+if scan_pages:
+    ocr_key = api_key if engine_name == "OpenAI" else secret("OPENAI_API_KEY")
+    ocr_model = model if engine_name == "OpenAI" else getattr(engines, "DEFAULT_OPENAI_MODEL",
+                                                               list(engines.OPENAI_MODELS)[0])
+    krw = engines.ocr_cost_krw(ocr_model, len(scan_pages))
+    st.warning(f"📷 스캔된 쪽이 {len(scan_pages)}개 있습니다. 글자가 사진으로 되어 있어 먼저 **글자 읽기(OCR)**를 해야 "
+               f"번역할 수 있습니다. OpenAI({ocr_model})가 쪽 이미지를 읽으며"
+               + (f" 예상 비용은 약 {krw:,}원입니다." if krw is not None else ".")
+               + " 읽은 결과는 저장되어 다시 비용이 들지 않습니다.")
+    if not ocr_key:
+        st.caption("OpenAI API Key가 필요합니다.")
+    if st.button(f"📷 스캔 쪽 {len(scan_pages)}개 글자 읽기", type="primary", disabled=not ocr_key):
+        # PyMuPDF는 여러 스레드에서 쓰면 안 되므로 이미지는 먼저 만들어 둔다
+        pngs = {pg["page_number"]: src[pg["page_number"] - 1].get_pixmap(dpi=engines.OCR_DPI).tobytes("png")
+                for pg in scan_pages}
+        bar = st.progress(0.0)
+        status = st.empty()
+        fails: dict[int, str] = {}
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(engines.ocr_page, ocr_key, ocr_model, png): pno for pno, png in pngs.items()}
+            for fut in as_completed(futs):
+                pno = futs[fut]
+                try:
+                    ocr_data[str(pno)] = fut.result()
+                    save_cache(f"ocr_{paper_id}", ocr_data)
+                except engines.EngineError as e:
+                    fails[pno] = str(e)
+                    if e.fatal:
+                        for f in futs:
+                            f.cancel()
+                done += 1
+                bar.progress(done / len(pngs))
+                status.write(f"글자 읽는 중… {done} / {len(pngs)}쪽")
+        if lib is not None and ocr_data:
+            try:
+                lib.check()
+                lib.write(f"papers/{paper_id}/ocr.json",
+                          json.dumps(ocr_data, ensure_ascii=False).encode("utf-8"), "스캔 쪽 글자 읽기 결과")
+            except library.LibraryError as e:
+                st.error(f"글자 읽기 결과를 서재에 저장하지 못했습니다: {e}")
+        for pno, msg in sorted(fails.items()):
+            st.error(f"Page {pno} 글자 읽기 실패 — {msg}")
+        if not fails:
+            st.rerun()
+elif ocr_data:
+    st.caption("📷 스캔 쪽은 저장된 글자 읽기(OCR) 결과로 번역합니다.")
 bad = [pg["page_number"] for pg in pages if pg["mode"] == "error"]
 if bad:
     st.warning(f"텍스트 추출에 실패한 페이지: {bad} — 이 페이지들은 원문 그대로 들어갑니다.")
@@ -279,7 +348,6 @@ opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, target, trans
                                    glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
-paper_id = pdf_hash[:16]
 if st.session_state.get("cache_key") != cache_key:
     st.session_state.cache_key = cache_key
     st.session_state.cache = load_cache(cache_key)
@@ -555,7 +623,8 @@ if translated_count:
         progress = json.dumps({"_key": cache_key, **cache}, ensure_ascii=False).encode("utf-8")
         with st.spinner("서재에 저장하는 중…"):
             lib.check()
-            lib.save_paper(meta, {"translation.pdf": full_pdf, "original.pdf": pdf_bytes,
+            extra = {"ocr.json": json.dumps(ocr_data, ensure_ascii=False).encode("utf-8")} if ocr_data else {}
+            lib.save_paper(meta, {**extra, "translation.pdf": full_pdf, "original.pdf": pdf_bytes,
                                   "progress.json": progress})
         st.session_state.pop("lib_items", None)
         st.session_state.lib_meta = None

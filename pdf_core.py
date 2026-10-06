@@ -256,15 +256,31 @@ def _rotated_ratio(raw: dict) -> float:
     return rot / tot if tot else 0.0
 
 
+def is_scanned(page: pymupdf.Page, raw: dict) -> bool:
+    """글자는 거의 없고 큰 이미지가 쪽을 덮고 있으면 스캔 쪽.
+    (스캔본에 OCR 글자층이 있어도 글자가 엉망인 경우가 많아, 글자층이 빈약하면 스캔으로 본다)"""
+    chars = sum(len(s["chars"]) for b in raw["blocks"] for l in b.get("lines", []) for s in l["spans"])
+    area = page.rect.width * page.rect.height
+    img_area = 0.0
+    for b in raw["blocks"]:
+        if b["type"] == 1:
+            r = pymupdf.Rect(b["bbox"]) & page.rect
+            img_area += r.width * r.height
+    return chars < 200 and img_area > area * 0.5
+
+
 def extract_page(page: pymupdf.Page) -> dict[str, Any]:
     """원문 페이지 1장 → {"mode", "body_size", "blocks"}.
 
     mode = "text"  : 일반 페이지 (블록 단위로 번역)
            "image" : 가로로 돌려 앉힌 표처럼 글자 대부분이 회전된 페이지 → 원문을 그대로 넣는다
+           "scan"  : 글자가 사진으로 된 스캔 쪽 → OCR(build_ocr_page) 후 "text"가 된다
     """
     raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES)
     body = body_size_of(raw)
     H = page.rect.height
+    if is_scanned(page, raw):
+        return {"mode": "scan", "body_size": 10.0, "blocks": []}
     if _rotated_ratio(raw) > 0.5:
         # 가로로 돌려 놓은 표 페이지: 칸 구조를 읽어 표로 번역. 실패하면 원문 그대로.
         try:
@@ -772,7 +788,8 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
     if pg["mode"] != "text" or note:
         page = out.new_page(width=W, height=H)
         page.show_pdf_page(pymupdf.Rect(18, 40, W - 18, H - 10), src_doc, pno - 1)
-        msg = note or ("가로 방향 표 페이지 — 원문 그대로" if pg["mode"] == "image" else "원문 그대로")
+        msg = note or {"image": "가로 방향 표 페이지 — 원문 그대로",
+                       "scan": "스캔 쪽 — 글자 읽기(OCR) 전이라 원문 그대로"}.get(pg["mode"], "원문 그대로")
         page.insert_htmlbox(pymupdf.Rect(18, 14, W - 18, 38), _label_html(f"{label} · {msg}"),
                             css=CSS, archive=archive)
         return 1
@@ -849,3 +866,104 @@ def page_text(pg: dict, translated: bool = True) -> str:
         else:
             parts.append(plain(b.get("tr", b["html"]) if translated else b["html"]))
     return "\n\n".join(parts)
+
+
+# ─────────────────────── 7. 스캔 쪽 (OCR 결과) ───────────────────────
+OCR_KINDS = {"header", "heading", "title", "para", "list_item", "caption", "footnote", "reference",
+             "figure", "table", "note", "dialogue"}
+
+
+def _clean_ocr_html(s: str) -> str:
+    """OCR 결과 글에서 허용한 태그(<i> <b> <sup>)만 남기고 나머지는 이스케이프."""
+    parts = re.split(r"(</?(?:i|b|sup)>)", s)
+    return _protect("".join(p if re.fullmatch(r"</?(?:i|b|sup)>", p) else esc(p) for p in parts))
+
+
+def build_ocr_page(page: pymupdf.Page, ocr_blocks: list[dict], page_number: int) -> dict[str, Any]:
+    """OCR로 읽은 블록 목록 → 일반 페이지와 같은 형식의 페이지.
+    ocr_blocks: [{"kind", "text", "rows", "bbox": [x0,y0,x1,y1] (쪽 크기에 대한 0~1 비율)}]"""
+    W, H = page.rect.width, page.rect.height
+    blocks: list[dict[str, Any]] = []
+    list_buf: list[dict] = []
+
+    def rect_of(b: dict) -> pymupdf.Rect:
+        x0, y0, x1, y1 = (list(b.get("bbox") or [0, 0, 1, 1]) + [0, 0, 1, 1])[:4]
+        r = pymupdf.Rect(max(0, x0) * W, max(0, y0) * H, min(1, x1) * W, min(1, y1) * H)
+        r.normalize()
+        return r
+
+    def flush_list() -> None:
+        if not list_buf:
+            return
+        r = rect_of(list_buf[0])
+        for b in list_buf[1:]:
+            r |= rect_of(b)
+        items = [_clean_ocr_html(b["text"].lstrip("•·-–▪ ")) for b in list_buf]
+        blocks.append({"kind": "list", "bbox": r, "size": 10.0, "items": items, "html": "",
+                       "text": "\n".join("• " + plain(h) for h in items)})
+        list_buf.clear()
+
+    for b in ocr_blocks:
+        kind = b.get("kind", "para")
+        if kind not in OCR_KINDS:
+            kind = "para"
+        if kind == "list_item":
+            list_buf.append(b)
+            continue
+        flush_list()
+        r = rect_of(b)
+        if kind == "figure":
+            if r.width > 20 and r.height > 20:
+                blocks.append({"kind": "figure", "bbox": r, "size": 10.0, "html": "", "text": ""})
+            continue
+        if kind == "table" and b.get("rows"):
+            rows = [[_clean_ocr_html(c) for c in row] for row in b["rows"] if row]
+            ncol = max(len(row) for row in rows)
+            items: list[str] = []
+            grid: list[list[list[int]]] = []
+            for row in rows:
+                cells: list[list[int]] = []
+                for c in range(ncol):
+                    if c < len(row) and plain(row[c]).strip():
+                        items.append(row[c])
+                        cells.append([len(items) - 1])
+                    else:
+                        cells.append([])
+                grid.append(cells)
+            header = [cell[0] if cell else None for cell in grid[0]]
+            layout = {"title": None, "super": None, "header": header, "rows": grid[1:] or grid, "note": None,
+                      "bulleted": [], "col_x": [r.width * k / ncol for k in range(ncol + 1)], "width": r.width}
+            blocks.append({"kind": "table", "bbox": r, "size": 9.0, "items": items, "layout": layout,
+                           "html": "", "text": "\n".join(plain(i) for i in items)})
+            continue
+        html = _clean_ocr_html(b.get("text", ""))
+        if not plain(html).strip():
+            continue
+        if kind == "dialogue":
+            turns = [t for t in re.split(r"\n+", b.get("text", "")) if t.strip()]
+            blocks.append({"kind": "dialogue", "bbox": r, "size": 10.0,
+                           "items": [_clean_ocr_html(t) for t in turns], "html": "",
+                           "text": "\n".join(turns)})
+            continue
+        title = kind == "title"
+        if title:
+            kind = "heading"
+        blocks.append({"kind": kind, "bbox": r, "size": 10.0, "html": html, "text": plain(html),
+                       "centered": False, "title": title})
+    flush_list()
+    return {"mode": "text", "body_size": 10.0, "blocks": blocks, "page_number": page_number, "ocr": True}
+
+
+def apply_ocr(doc: pymupdf.Document, pages: list[dict], ocr: dict[str, list[dict]]) -> list[dict]:
+    """스캔 쪽을 OCR 결과로 바꾼 새 페이지 목록 (원래 목록은 그대로 둔다).
+    OCR이 끝난 쪽끼리는 쪽 경계에서 끊긴 문장도 앞 쪽으로 모은다."""
+    import copy
+    out = copy.deepcopy(pages)
+    changed = False
+    for i, pg in enumerate(out):
+        if pg["mode"] == "scan" and str(pg["page_number"]) in ocr:
+            out[i] = build_ocr_page(doc[i], ocr[str(pg["page_number"])], pg["page_number"])
+            changed = True
+    if changed:
+        carry_cross_page(out)
+    return out
