@@ -16,6 +16,7 @@ pdf_core.py — 논문 PDF 추출 · 번역 PDF 조판 엔진 (Streamlit UI와 �
   caption   FIGURE n / TABLE n 캡션
   figure    그림·표·도식 영역 — 원문에서 이미지로 잘라 그대로 넣음 (내부 글자는 번역 안 함)
   footnote  각주 — 페이지 아래 구분선 밑에 배치
+  note      본문 중간의 작은 글씨(그림 옆 면담 대화문 등) — 제자리에 작게
   reference 참고문헌 한 항목 — 옵션에 따라 원문 유지
 """
 from __future__ import annotations
@@ -91,13 +92,19 @@ def body_size_of(page_dict: dict) -> float:
     return statistics.mode(sizes) if sizes else 10.0
 
 
-def _line(line: dict, body: float) -> dict:
-    """한 줄 → {html, text, x0, size, sans}. 이탤릭은 <i>, 위첨자 각주번호는 <sup>."""
+def _line(line: dict, body: float, mixed: bool = True) -> dict:
+    """한 줄 → {html, text, x0, size, sans}. 이탤릭은 <i>, 위첨자 각주번호는 <sup>.
+    mixed: 블록 안에 본문 글꼴(세리프)이 섞여 있는지. 블록 전체가 산세리프면(면담 대화문,
+    그림 설명 등) 산세리프 시작을 run-in 소제목으로 보지 않는다."""
     html_parts: list[str] = []
     plain_parts: list[str] = []
     sans = ""
     max_size = 0.0
     base_y = max(s["bbox"][3] for s in line["spans"])
+
+    def is_sans(sp: dict) -> bool:
+        return any(f in sp["font"].lower() for f in SANS_FONTS)
+
     for idx, s in enumerate(line["spans"]):
         t = _span_text(s, s["size"])
         if not t:
@@ -110,10 +117,11 @@ def _line(line: dict, body: float) -> dict:
         elif s["flags"] & ITALIC_FLAG and len(t.strip()) >= ITALIC_MIN_CHARS:
             lead = e[: len(e) - len(e.lstrip())]
             e = f"{lead}<i>{e.strip()}</i>"
-        elif idx == 0 and any(f in s["font"].lower() for f in SANS_FONTS) and t.strip():
+        elif idx == 0 and is_sans(s) and t.strip():
             # 본문과 다른 산세리프로 시작 → 'Describing data.' 같은 run-in 소제목
             sans = t
-            e = f"<b>{e}</b>"
+            if mixed:
+                e = f"<b>{e}</b>"
         html_parts.append(e)
         plain_parts.append(t)
     return {"html": "".join(html_parts), "text": "".join(plain_parts),
@@ -218,7 +226,10 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         if b["type"] != 0:
             continue
         bbox = pymupdf.Rect(b["bbox"])
-        lines = [_line(l, body) for l in b["lines"] if abs(l["dir"][0] - 1) < 0.01]
+        mixed = any(not any(f in sp["font"].lower() for f in SANS_FONTS)
+                    for l in b["lines"] for sp in l["spans"]
+                    if "".join(c["c"] for c in sp["chars"]).strip())
+        lines = [_line(l, body, mixed) for l in b["lines"] if abs(l["dir"][0] - 1) < 0.01]
         lines = [x for x in lines if x["text"].strip()]
         if not lines:
             continue
@@ -268,8 +279,38 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
                        "text": plain, "lines": lines, "centered": centered,
                        "title": kind == "heading" and size > body * 1.4})
 
+    # 작은 글씨라도 그 아래에 본문 문단이 있으면 각주가 아니다 (그림 옆 대화문, 표 주석 등)
+    body_tops = [b["bbox"].y0 for b in blocks if b["kind"] == "para" and b["size"] >= body * 0.95]
+    for b in blocks:
+        if b["kind"] == "footnote" and not re.match(r"^(\d+|\*|†)", b["text"]) \
+                and any(y > b["bbox"].y1 for y in body_tops):
+            b["kind"] = "note"
+        elif b["kind"] == "para" and b["size"] < body * 0.85:
+            b["kind"] = "note"
+
     ordered = sort_reading_order(blocks, page.rect)
+    ordered = _merge_continuations(ordered)
     return {"mode": "text", "body_size": body, "blocks": _merge_headings(ordered)}
+
+
+def _merge_continuations(blocks: list[dict]) -> list[dict]:
+    """줄마다 따로 잡힌 블록 중 앞 블록에서 이어지는 것('win-' + 'tertime.')을 합친다.
+    조건: 같은 종류, 바로 아래(간격이 글자 크기 이하), 다음 블록이 소문자로 시작하거나
+    앞 블록이 하이픈으로 끝남."""
+    out: list[dict] = []
+    for b in blocks:
+        prev = out[-1] if out else None
+        if (prev and prev["kind"] == b["kind"] and b["kind"] in ("para", "note", "footnote")
+                and prev.get("lines") and b.get("lines")
+                and -2 <= b["bbox"].y0 - prev["bbox"].y1 <= b["size"] * 1.0
+                and (prev["text"].endswith("-") or b["text"][:1].islower())
+                and not SENTENCE_END_RE.search(prev["text"])):
+            h, t = join_lines(prev["lines"] + b["lines"])
+            prev.update(html=_protect(h), text=t, lines=prev["lines"] + b["lines"])
+            prev["bbox"] |= b["bbox"]
+            continue
+        out.append(b)
+    return out
 
 
 def _merge_headings(blocks: list[dict]) -> list[dict]:
@@ -399,9 +440,13 @@ def carry_cross_page(pages: list[dict]) -> None:
             continue
         body = [b for b in pages[i]["blocks"] if b["kind"] not in ("header", "footnote")]
         nxt = [b for b in pages[i + 1]["blocks"] if b["kind"] not in ("header", "footnote")]
-        if not body or not nxt or body[-1]["kind"] != "para" or nxt[0]["kind"] != "para":
+        if not body or not nxt or body[-1]["kind"] != "para":
             continue
-        last, first = body[-1], nxt[0]
+        last = body[-1]
+        # 다음 쪽 맨 위에 그림이 있어도, 그 아래 첫 문단이 소문자로 시작하면 이어지는 문단이다
+        first = next((b for b in nxt if b["kind"] == "para"), None)
+        if first is None or (first is not nxt[0] and not first["text"][:1].islower()):
+            continue
         if SENTENCE_END_RE.search(last["text"]):
             continue
         if last["size"] < pages[i]["body_size"] * 0.95 or first["size"] < pages[i + 1]["body_size"] * 0.95:
@@ -493,6 +538,7 @@ b {{ font-weight: bold; }}
 sup {{ font-size: 0.7em; }}
 .cap {{ font-size: 0.85em; text-align: center; margin: 0.2em 0 0.7em 0; }}
 .fig {{ text-align: center; margin: 0.3em 0 0.2em 0; }}
+.note {{ font-size: 0.85em; line-height: 1.45; margin: 0 0 0.25em 1.5em; }}
 .fn {{ font-size: 0.8em; line-height: 1.45; color: #333; }}
 .ref {{ font-size: 0.8em; line-height: 1.4; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
 hr {{ border: none; border-top: 0.5px solid #999; width: 30%; margin: 0.6em 0 0.4em 0; }}
@@ -531,6 +577,8 @@ def _pieces(blocks: list[dict]) -> list[str]:
             out.append("<ul>" + "".join(f"<li>{to_reading_html(t)}</li>" for t in items) + "</ul>")
         elif k == "caption":
             out.append(f'<p class="cap">{to_reading_html(tr)}</p>')
+        elif k == "note":
+            out.append(f'<p class="note">{to_reading_html(tr)}</p>')
         elif k == "reference":
             # 참고문헌은 학술지명 이탤릭을 볼드로 바꾸지 않는다 (지저분해짐)
             out.append(f'<p class="ref">{to_reading_html(tr, italic_to_bold=False)}</p>')

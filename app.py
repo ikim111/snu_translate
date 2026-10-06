@@ -58,7 +58,8 @@ if secret("APP_PASSWORD") and not st.session_state.get("authed"):
 # ─────────────────────────── 사이드바 ───────────────────────────
 with st.sidebar:
     st.header("번역 엔진")
-    engine_name = st.radio("엔진", ["DeepL", "OpenAI"], horizontal=True, label_visibility="collapsed")
+    engine_name = st.radio("엔진", ["OpenAI", "DeepL"], horizontal=True, label_visibility="collapsed",
+                           help="비교해 보니 학술 용어·문체는 OpenAI가 더 나았습니다.")
     if engine_name == "DeepL":
         api_key = st.text_input("DeepL API Key", value=secret("DEEPL_API_KEY"), type="password",
                                 help="키는 저장되지 않습니다. SDK가 키 종류에 맞는 서버로 연결합니다.")
@@ -159,7 +160,9 @@ if bad:
 start, end = st.slider("번역할 페이지 범위", 1, n_pages, (1, n_pages))
 sel = [pg for pg in pages if start <= pg["page_number"] <= end]
 
-opts_sig = hashlib.md5(json.dumps([engine_name, model, target, translate_refs, translate_captions, glossary_entries],
+prompt_ver = engines.PROMPT_VERSION if engine_name == "OpenAI" else ""
+opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, target, translate_refs, translate_captions,
+                                   glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
 if st.session_state.get("cache_key") != cache_key:
@@ -173,9 +176,19 @@ def units_of(pg: dict) -> list[tuple[int, int | None, str]]:
     return core.translatable_units(pg, translate_refs, translate_captions)
 
 
-todo = [pg for pg in sel if pg["mode"] == "text" and str(pg["page_number"]) not in cache]
+def units_sig(pg: dict) -> str:
+    return hashlib.md5("\x1f".join(h for *_, h in units_of(pg)).encode()).hexdigest()[:12]
+
+
+def cached_ok(pg: dict) -> bool:
+    """이 페이지의 번역이 캐시에 있고, 지금 추출한 원문 조각과 짝이 맞는지."""
+    e = cache.get(str(pg["page_number"]))
+    return bool(e) and e.get("sig") == units_sig(pg) and len(e.get("tr", [])) == len(units_of(pg))
+
+
+todo = [pg for pg in sel if pg["mode"] == "text" and not cached_ok(pg)]
 need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
-done_in_range = sum(1 for pg in sel if str(pg["page_number"]) in cache)
+done_in_range = sum(1 for pg in sel if cached_ok(pg))
 if engine_name == "OpenAI":
     krw = engines.openai_cost_krw(model, need_chars)
     cost = f" · 예상 비용 약 {krw:,}원" if krw is not None else ""
@@ -245,7 +258,8 @@ if st.button("번역 시작", type="primary", disabled=not todo):
             pno = pg["page_number"]
             try:
                 tr = fut.result()
-                cache[str(pno)] = {"tr": tr, "original": core.page_text(pg, translated=False)}
+                cache[str(pno)] = {"tr": tr, "sig": units_sig(pg),
+                                   "original": core.page_text(pg, translated=False)}
                 save_cache(cache_key, cache)
             except engines.EngineError as e:
                 failures[pno] = str(e)
@@ -259,7 +273,7 @@ if st.button("번역 시작", type="primary", disabled=not todo):
             bar.progress(done / len(todo))
             status.write(f"번역 중… {done} / {len(todo)}쪽 (방금 끝난 페이지: {pno})")
 
-    status.write(f"번역 완료 페이지: {sum(1 for pg in sel if str(pg['page_number']) in cache)} / {len(sel)}")
+    status.write(f"번역 완료 페이지: {sum(1 for pg in sel if cached_ok(pg))} / {len(sel)}")
     if fatal:
         st.error(f"{fatal} — 번역을 멈췄습니다. 지금까지 번역한 페이지는 저장되어 있습니다.")
     for pno, msg in sorted(failures.items()):
@@ -274,7 +288,7 @@ if st.button("번역 시작", type="primary", disabled=not todo):
 def translated_page(pg: dict) -> dict | None:
     """캐시의 번역을 입힌 페이지 사본. 번역이 없으면 None."""
     entry = cache.get(str(pg["page_number"]))
-    if pg["mode"] != "text" or entry is None:
+    if pg["mode"] != "text" or not cached_ok(pg):
         return None
     tpg = copy.deepcopy(pg)
     core.apply_translations(tpg, units_of(tpg), entry["tr"])
@@ -305,7 +319,7 @@ def build_outputs() -> dict[str, bytes]:
     return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8")}
 
 
-translated_count = sum(1 for pg in sel if str(pg["page_number"]) in cache)
+translated_count = sum(1 for pg in sel if cached_ok(pg))
 if translated_count:
     build_sig = (cache_key, start, end, interleave, len(cache))
     if st.session_state.get("built", (None,))[0] != build_sig:

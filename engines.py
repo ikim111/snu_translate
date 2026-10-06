@@ -181,12 +181,27 @@ Rules — follow all of them strictly:
    including direct quotations, examples, and parenthetical remarks.
 2. Keep the HTML tags <i>, </i>, <b>, </b>, <sup>, </sup> and wrap the corresponding translated
    words with them. Keep every <span translate="no">...</span> exactly as it is, untranslated.
-3. Keep author names, years, in-text citations such as (Smith & Jones, 2023), statistics such as
-   p < .05, F(2, 318) = 4.52, M = 3.24, SD = 0.81, numbers, URLs and DOIs exactly as in the source.
-4. Use a formal academic written style (for Korean: 평서체 "~이다/~한다").
-5. Use consistent terminology across segments.{glossary}
-6. A segment may be a heading, a list item, a figure/table caption, a footnote, or a reference entry;
+3. Keep author names in their original spelling, years, statistics such as p < .05,
+   F(2, 318) = 4.52, M = 3.24, SD = 0.81, numbers, URLs and DOIs exactly as in the source.
+4. Citations: a citation inside parentheses stays exactly as in the source,
+   e.g. (Mokros & Russell, 1995; Beaton et al., 1996). A citation that is part of the sentence
+   is written the way Korean academic papers do it — translate "and", possessive "'s" and "et al.":
+   "Biggs and Collis (1991) proposed" → "Biggs와 Collis(1991)는 … 제안하였다",
+   "Carr and Begg's (1994) study" → "Carr와 Begg(1994)의 연구",
+   "Jones et al. (2000) developed" → "Jones 등(2000)은 … 개발하였다",
+   "Shaughnessy, Garfield, and Greer (1996)" → "Shaughnessy, Garfield, Greer(1996)".
+5. <sup>n</sup> is a footnote number. Put it directly after the translated word or phrase that it
+   follows in the source (e.g. "통계적 사고<sup>1</sup>"), never after an unrelated comma.
+6. Use a formal academic written style (for Korean: 평서체 "~이다/~한다").
+7. Use consistent terminology across segments. For statistics education terms prefer the Korean
+   school-curriculum terms (data → 자료, measures of center → 대푯값,
+   measures of spread/dispersion → 산포도, box-and-whisker plot → 상자그림).{glossary}
+8. A segment may be a heading, a list item, a figure/table caption, a footnote, a short note such as
+   an interview transcript line ("I:" interviewer, "S:" student), or a reference entry;
    translate it as that kind of text."""
+
+# 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
+PROMPT_VERSION = "2026-10-06b"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:
