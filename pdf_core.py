@@ -890,7 +890,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             block_lines.append((pymupdf.Rect(b["bbox"]), lines))
 
     figs = _grow_figures(figs, block_lines, page.rect)
-    blocks: list[dict[str, Any]] = [_figure_block(r, raw, body) for r in figs]
+    blocks: list[dict[str, Any]] = [_figure_block(r, raw, body, page) for r in figs]
 
     def in_fig(r: pymupdf.Rect) -> bool:
         c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
@@ -1036,7 +1036,35 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
 FIG_NUMBERISH_RE = re.compile(r"\(\s*[nN]\s*=|%")
 
 
-def _figure_block(r: pymupdf.Rect, raw: dict, body: float) -> dict[str, Any]:
+def _figure_ocr_words(page: pymupdf.Page, clip: pymupdf.Rect) -> set[str] | None:
+    """그림 영역만 400dpi로, 망점(회색 음영)을 흐리게 한 뒤 흑백으로 바꿔 다시 읽은 단어들."""
+    import numpy as np
+
+    td = _tessdata()
+    if not td:
+        return None
+    try:
+        dpi = 400
+        pix = page.get_pixmap(dpi=dpi, clip=clip, colorspace=pymupdf.csGRAY)
+        a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, : pix.width].astype(np.float32)
+        k = 3
+        pad = np.pad(a, k // 2, mode="edge")
+        acc = np.zeros_like(a)
+        for i in range(k):
+            for j in range(k):
+                acc += pad[i:i + a.shape[0], j:j + a.shape[1]]
+        bw = np.where(acc / (k * k) < 100, 0, 255).astype(np.uint8)
+        pm = pymupdf.Pixmap(pymupdf.csGRAY, pix.width, pix.height, bw.tobytes(), False)
+        doc = pymupdf.open()
+        pg = doc.new_page(width=clip.width, height=clip.height)
+        pg.insert_image(pg.rect, pixmap=pm)
+        tp = pg.get_textpage_ocr(language="eng", dpi=dpi, full=True, tessdata=td)
+        return {w.lower() for w in re.findall(r"[A-Za-z]{2,}", pg.get_text(textpage=tp))}
+    except Exception:
+        return None
+
+
+def _figure_block(r: pymupdf.Rect, raw: dict, body: float, page: pymupdf.Page | None = None) -> dict[str, Any]:
     """그림 블록. 그림 안의 글자(범주명·범례·도식 상자 글자)는 단어 단위로 모아 문구로 묶고
     번역 대상으로 둔다 (그림은 원본 그대로, 같은 쪽에 '원문 | 번역' 대응표). 숫자·눈금·'82%(n=37)'은 제외."""
     words: list[tuple[pymupdf.Rect, str]] = []
@@ -1062,15 +1090,16 @@ def _figure_block(r: pymupdf.Rect, raw: dict, body: float) -> dict[str, Any]:
     rows: list[list] = []
     for w in words:
         yc = (w[0].y0 + w[0].y1) / 2
-        if rows and abs(rows[-1][0][0].y0 + rows[-1][0][0].y1 - 2 * yc) / 2 < w[0].height * 0.5:
+        if rows and abs((rows[-1][0][0].y0 + rows[-1][0][0].y1) / 2 - yc) < w[0].height * 0.5:
             rows[-1].append(w)
         else:
             rows.append([w])
-    runs: list[list] = []                      # [단어 목록]
+    runs: list[list] = []
     for row in rows:
         row.sort(key=lambda w: w[0].x0)
+        start = len(runs)
         for w in row:
-            if runs and runs[-1][-1] in row and 0 <= w[0].x0 - runs[-1][-1][0].x1 < max(w[0].height, 1) * 0.6:
+            if len(runs) > start and 0 <= w[0].x0 - runs[-1][-1][0].x1 < max(w[0].height, 1) * 0.6:
                 runs[-1].append(w)
             else:
                 runs.append([w])
@@ -1081,20 +1110,19 @@ def _figure_block(r: pymupdf.Rect, raw: dict, body: float) -> dict[str, Any]:
             r_ |= w[0]
         return r_
 
-    # 범주명은 보통 가운데 정렬: 붙어 읽힌 이웃 범주('performance'+'pressure for')는 위아래 줄의 가운데와 맞춰 나눈다
-    def centers_except(run: list) -> list[float]:
-        return [(span(o).x0 + span(o).x1) / 2 for o in runs if o is not run]
+    def cx(ws: list) -> float:
+        r_ = span(ws)
+        return (r_.x0 + r_.x1) / 2
 
+    # 범주명은 보통 가운데 정렬: 붙어 읽힌 이웃 범주('performance'+'pressure for')는
+    # 위아래 줄 조각의 가운데와 맞춰 나눈다
     out_runs: list[list] = []
     for run in runs:
-        cs = centers_except(run)
-        whole = (span(run).x0 + span(run).x1) / 2
+        cs = [cx(o) for o in runs if o is not run]
         best = None
-        if len(run) > 1 and not any(abs(whole - c_) < 6 for c_ in cs):
+        if len(run) > 1 and not any(abs(cx(run) - c_) < 6 for c_ in cs):
             for k in range(1, len(run)):
-                a_, b_ = span(run[:k]), span(run[k:])
-                if any(abs((a_.x0 + a_.x1) / 2 - c_) < 6 for c_ in cs) and \
-                        any(abs((b_.x0 + b_.x1) / 2 - c_) < 6 for c_ in cs):
+                if any(abs(cx(run[:k]) - c_) < 6 for c_ in cs) and any(abs(cx(run[k:]) - c_) < 6 for c_ in cs):
                     best = k
                     break
         out_runs += [run[:best], run[best:]] if best else [run]
@@ -1113,16 +1141,26 @@ def _figure_block(r: pymupdf.Rect, raw: dict, body: float) -> dict[str, Any]:
         else:
             groups.append([pymupdf.Rect(bb), t])
     groups.sort(key=lambda g: (round(g[0].y0 / 12), g[0].x0))
-    items, boxes = [], []
+    # 스캔 그림: 잡티를 없앤 고해상도 이미지로 한 번 더 읽어, 두 번 다 같은 단어로 읽힌 문구만 쓴다
+    check = _figure_ocr_words(page, r) if raw.get("_reocr") and page is not None else None
+    items, boxes, unsure = [], [], []
     for bb, t in groups:
         t = t.strip()
         if NUMERIC_LABEL_RE.match(t) or FIG_NUMBERISH_RE.search(t) or len(re.findall(r"[A-Za-z]", t)) < 2 \
                 or CAPTION_RE.match(t):
             continue
+        toks = [w.lower() for w in re.findall(r"[A-Za-z]{2,}", t)]
+        good = sum(1 for w in toks if check is None or w in check)
+        if not toks or good < len(toks) * 0.8 or not re.search(r"[A-Za-z]{3,}", t):
+            unsure.append([round(x) for x in bb])      # 판독이 불확실한 문구: 추측해서 번역하지 않는다
+            continue
         items.append(_protect(esc(t)))
         boxes.append(bb)
-    return {"kind": "figure", "bbox": r, "size": body, "html": "", "text": "\n".join(items),
-            "items": items, "item_boxes": boxes}
+    blk = {"kind": "figure", "bbox": r, "size": body, "html": "", "text": "\n".join(items),
+           "items": items, "item_boxes": boxes}
+    if unsure:
+        blk["review"] = f"그림 속 문구 {len(unsure)}개는 글자를 확실히 읽지 못해 번역하지 않음 — 원문 그림 참조 (위치 {unsure[:6]})"
+    return blk
 
 
 def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None:
@@ -2239,8 +2277,11 @@ def structure_record(pages: list[dict], tpages: dict[int, dict | None], reviews:
                 rec["translation"] = plain(tb["tr"])
             if tb.get("tr_items"):
                 rec["translation_items"] = [plain(x) for x in tb["tr_items"]]
+            if b.get("review"):
+                rec["review"] = b["review"]
             if b["kind"] == "header":
-                rec["excluded"] = "머리글·꼬리글·쪽 번호·다운로드 안내 (번역하지 않음)"
+                rec["excluded"] = ("괘선을 글자로 읽은 잡음" if b.get("noise")
+                                   else "머리글·꼬리글·쪽 번호·다운로드 안내 (번역하지 않음)")
             elif b["kind"] == "reference":
                 rec["excluded"] = "참고문헌 (원문 유지)"
             blocks.append(rec)
