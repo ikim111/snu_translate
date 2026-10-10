@@ -17,12 +17,13 @@ Streamlit Community Cloud의 디스크는 앱이 잠들거나 다시 배포되�
     papers/<paper_id>/ocr.json       스캔 쪽 글자 읽기(OCR) 결과
     glossary.json                    내 용어집 {영어: 한국어}
 
-paper_id는 원문 PDF의 해시 앞 16자라서, 같은 논문은 항상 같은 자리에 덮어쓴다.
+새 저장 버전은 원문 해시와 파일 내용 해시를 합친 ID를 사용한다. 기존 paper_id 경로도 읽을 수 있다.
 """
 from __future__ import annotations
 
 import base64
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -112,9 +113,16 @@ class Library:
         self.write("index.json", json.dumps(items, ensure_ascii=False, indent=1).encode("utf-8"), message)
 
     def save_paper(self, meta: dict, files: dict[str, bytes]) -> dict:
-        """논문 하나 저장(같은 paper_id면 덮어씀). files: {파일명: 바이트}"""
-        pid = meta["id"]
-        meta = {**meta, "updated": datetime.now(KST).strftime("%Y-%m-%d %H:%M")}
+        """Save an immutable revision; old complete and partial versions remain available."""
+        paper_id = meta.get("paper_id", meta["id"])
+        digest = hashlib.sha256()
+        for name, data in sorted(files.items()):
+            digest.update(name.encode())
+            digest.update(hashlib.sha256(data).digest())
+        revision = digest.hexdigest()[:16]
+        pid = f"{paper_id}_{revision}"
+        meta = {**meta, "id": pid, "paper_id": paper_id, "revision": revision}
+        meta = {**meta, "updated": datetime.now(KST).isoformat(timespec="microseconds")}
         title = meta.get("title", pid)[:60]
         for name, data in files.items():
             self.write(f"papers/{pid}/{name}", data, f"{title}: {name}")
@@ -123,6 +131,26 @@ class Library:
         items = [m for m in self.list_papers() if m.get("id") != pid] + [meta]
         self._save_index(items, f"서재 목록 갱신: {title}")
         return meta
+
+    def find_progress(self, paper_id: str, cache_key: str) -> bytes | None:
+        """Restore the latest matching revision; also supports legacy, unversioned papers."""
+        for meta in self.list_papers():
+            if meta.get("paper_id", meta["id"]) != paper_id:
+                continue
+            if meta.get("cache_key", "").split("_")[-2:] != cache_key.split("_")[-2:]:
+                continue
+            raw = self.get_file(meta["id"], "progress.json")
+            if raw:
+                return raw
+        return self.get_file(paper_id, "progress.json")
+
+    def find_ocr(self, paper_id: str) -> bytes | None:
+        for meta in self.list_papers():
+            if meta.get("paper_id", meta["id"]) == paper_id:
+                raw = self.get_file(meta["id"], "ocr.json")
+                if raw:
+                    return raw
+        return self.get_file(paper_id, "ocr.json")
 
     def get_file(self, pid: str, name: str) -> bytes | None:
         return self.read(f"papers/{pid}/{name}")
