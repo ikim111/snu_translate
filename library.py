@@ -13,6 +13,7 @@ Streamlit Community Cloud의 디스크는 앱이 잠들거나 다시 배포되�
     papers/<paper_id>/meta.json      제목, 날짜, 엔진, 쪽수 등
     papers/<paper_id>/translation.pdf
     papers/<paper_id>/original.pdf   원문 (나중에 번역비 없이 PDF를 다시 만들 때 필요)
+    papers/<paper_id>/structure.json.gz  원문 읽기 결과 (스캔본을 다시 읽지 않도록)
     papers/<paper_id>/progress.json  번역 데이터 (앱의 '진행 파일'과 같은 형식)
     papers/<paper_id>/ocr.json       스캔 쪽 글자 읽기(OCR) 결과
     glossary.json                    내 용어집 {영어: 한국어}
@@ -128,7 +129,7 @@ class Library:
         return self.read(f"papers/{pid}/{name}")
 
     def delete_paper(self, pid: str) -> None:
-        for name in ("translation.pdf", "original.pdf", "progress.json", "ocr.json", "meta.json"):
+        for name in ("translation.pdf", "original.pdf", "progress.json", "ocr.json", "structure.json.gz", "meta.json"):
             self.remove(f"papers/{pid}/{name}", f"삭제: {pid}/{name}")
         items = [m for m in self.list_papers() if m.get("id") != pid]
         self._save_index(items, f"서재 목록에서 삭제: {pid}")

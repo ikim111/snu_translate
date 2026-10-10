@@ -1837,18 +1837,69 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
                 blocks.remove(first)
 
 
-def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
-    """문서 전체 추출. 특정 페이지가 실패해도 나머지는 계속한다(mode='error')."""
-    pages: list[dict] = []
-    for i in range(doc.page_count):
-        if progress:
-            progress(i, doc.page_count)
+# 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
+EXTRACT_VERSION = "2026-10-11b"
+
+
+def _extract_one(doc: pymupdf.Document, i: int) -> dict:
+    try:
+        pg = extract_page(doc[i])
+    except Exception as e:
+        pg = {"mode": "error", "body_size": 10.0, "blocks": [], "error": str(e)}
+    pg["page_number"] = i + 1
+    return pg
+
+
+def _extract_chunk(pdf_bytes: bytes, idxs: list[int]) -> list[dict]:
+    """다른 프로세스에서 몇 쪽을 읽는다 (동시 처리용)."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for i in idxs:
+        pg = _extract_one(doc, i)
+        pg.pop("_rot_key", None)                # 돌린 쪽 원본은 이 프로세스 안에만 있다 → 메인에서 다시 읽음
+        out.append(pg)
+    return out
+
+
+def _scan_heavy(doc: pymupdf.Document) -> bool:
+    """스캔본(쪽마다 다시 읽기가 필요한 문서)인지 대충 본다."""
+    n = min(3, doc.page_count)
+    return sum(_page_is_image_backed(doc[i]) for i in range(n)) >= max(1, n - 1)
+
+
+def extract_document(doc: pymupdf.Document, progress=None, workers: int | None = None) -> list[dict]:
+    """문서 전체 추출. 특정 페이지가 실패해도 나머지는 계속한다(mode='error').
+    스캔본은 쪽 이미지를 다시 읽느라 느려서 여러 프로세스로 나눠 읽는다."""
+    n = doc.page_count
+    workers = workers if workers is not None else min(4, os.cpu_count() or 1)
+    pages: list[dict | None] = [None] * n
+    if workers > 1 and n >= 4 and _scan_heavy(doc):
+        import concurrent.futures as cf
+        import multiprocessing as mp
+
+        data = doc.tobytes()
+        chunks = [list(range(k, n, workers * 2)) for k in range(workers * 2)]   # 쪽을 고르게 나눈다
+        done = 0
         try:
-            pg = extract_page(doc[i])
-        except Exception as e:
-            pg = {"mode": "error", "body_size": 10.0, "blocks": [], "error": str(e)}
-        pg["page_number"] = i + 1
-        pages.append(pg)
+            with cf.ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
+                futs = [pool.submit(_extract_chunk, data, ch) for ch in chunks if ch]
+                for f in cf.as_completed(futs):
+                    for pg in f.result():
+                        pages[pg["page_number"] - 1] = pg
+                        done += 1
+                    if progress:
+                        progress(done, n)
+        except Exception:
+            pages = [None] * n                    # 동시 처리가 안 되는 환경이면 한 쪽씩
+        for i, pg in enumerate(pages):           # 돌린 쪽(가로 표)은 원본을 이 프로세스에 다시 만든다
+            if pg is not None and pg.get("rotated"):
+                pages[i] = _extract_one(doc, i)
+    for i in range(n):
+        if pages[i] is None:
+            if progress:
+                progress(i, n)
+            pages[i] = _extract_one(doc, i)
+    pages = list(pages)
     # 논문 첫 쪽(제목이 있는 쪽, 보통 1쪽이지만 JSTOR 표지가 있으면 2쪽): 위쪽 저널 정보는 지우지 않고 보존
     tsz = [max((b["size"] for b in p.get("blocks", []) if b.get("title") and b["kind"] == "heading"), default=0)
            for p in pages[:3]]
@@ -2656,3 +2707,57 @@ def apply_scan_check(html: str, italics: list[str], fixes: list[tuple[str, str]]
         if m and html.rfind("<", 0, m.start()) <= html.rfind(">", 0, m.start()):
             html = html[: m.start()] + f"<i>{ph_e}</i>" + html[m.end():]
     return html
+
+
+
+# ─────────────────────── 8. 읽기 결과 저장 (JSON) ───────────────────────
+def _enc(o):
+    if isinstance(o, pymupdf.Rect):
+        return {"__rect__": [o.x0, o.y0, o.x1, o.y1]}
+    if isinstance(o, dict):
+        return {k: _enc(v) for k, v in o.items() if not k.startswith("_rot")}
+    if isinstance(o, (list, tuple)):
+        return [_enc(v) for v in o]
+    if isinstance(o, (str, int, float, bool)) or o is None:
+        return o
+    return str(o)
+
+
+def _dec(o):
+    if isinstance(o, dict):
+        if set(o) == {"__rect__"}:
+            return pymupdf.Rect(*o["__rect__"])
+        return {k: _dec(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_dec(v) for v in o]
+    return o
+
+
+def dump_pages(pages: list[dict]) -> bytes:
+    """읽기 결과 → 압축 JSON (버전 포함)."""
+    import gzip
+    import json
+
+    return gzip.compress(json.dumps({"version": EXTRACT_VERSION, "pages": _enc(pages)},
+                                    ensure_ascii=False).encode("utf-8"))
+
+
+def load_pages(data: bytes, doc: pymupdf.Document) -> list[dict] | None:
+    """저장한 읽기 결과 → 쪽 목록. 버전이 다르거나 쪽 수가 다르면 None (다시 읽어야 함).
+    가로로 돌린 표 쪽은 돌린 원본이 저장되지 않으므로 그 쪽만 다시 읽는다."""
+    import gzip
+    import json
+
+    try:
+        obj = json.loads(gzip.decompress(data).decode("utf-8"))
+    except Exception:
+        return None
+    if obj.get("version") != EXTRACT_VERSION or len(obj.get("pages", [])) != doc.page_count:
+        return None
+    pages = _dec(obj["pages"])
+    for i, pg in enumerate(pages):
+        if pg.get("rotated"):
+            fresh = _extract_one(doc, i)
+            fresh["printed"] = pg.get("printed")
+            pages[i] = fresh
+    return pages

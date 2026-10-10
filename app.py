@@ -288,11 +288,41 @@ except Exception as e:
 
 paper_id = pdf_hash[:16]
 if st.session_state.get("pdf_hash") != pdf_hash:
-    with st.spinner("PDF 구조 분석 중… (스캔본은 쪽 이미지를 다시 읽느라 쪽당 몇 초 걸립니다)"):
-        prog = st.progress(0.0)
-        st.session_state.base_pages = core.extract_document(
-            src, progress=lambda i, n: prog.progress(i / n, text=f"원문 읽는 중… {i} / {n}쪽"))
-        prog.empty()
+    # 읽기 결과는 서버 디스크와 서재에 저장해 두고 다시 쓴다 (읽는 방식이 바뀌면 버전이 달라 새로 읽음)
+    xpath = CACHE_DIR / f"extract_{pdf_hash[:16]}.json.gz"
+    loaded = None
+    with st.spinner("저장해 둔 원문 읽기 결과를 찾는 중…"):
+        try:
+            if xpath.exists():
+                loaded = core.load_pages(xpath.read_bytes(), src)
+        except Exception:
+            loaded = None
+        if loaded is None and lib is not None:
+            try:
+                data = lib.get_file(paper_id, "structure.json.gz")
+                loaded = core.load_pages(data, src) if data else None
+            except Exception:
+                loaded = None
+    if loaded is not None:
+        st.session_state.base_pages = loaded
+        st.toast("저장해 둔 원문 읽기 결과를 불러왔습니다.")
+    else:
+        with st.spinner("PDF 구조 분석 중… (스캔본은 쪽 이미지를 다시 읽느라 처음 한 번은 몇 분 걸립니다)"):
+            prog = st.progress(0.0)
+            st.session_state.base_pages = core.extract_document(
+                src, progress=lambda i, n: prog.progress(min(1.0, i / n), text=f"원문 읽는 중… {i} / {n}쪽"))
+            prog.empty()
+        blob = core.dump_pages(st.session_state.base_pages)
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            xpath.write_bytes(blob)
+        except Exception:
+            pass
+        if lib is not None:
+            try:
+                lib.write(f"papers/{paper_id}/structure.json.gz", blob, f"원문 읽기 결과: {paper_id}")
+            except Exception:
+                pass                              # 서재 저장 실패해도 번역은 계속
     st.session_state.pdf_hash = pdf_hash
     st.session_state.pop("built", None)
     st.session_state.pop("pages_ocr_sig", None)
