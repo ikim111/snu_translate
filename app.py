@@ -453,6 +453,15 @@ if st.session_state.get("base_pdf"):
         base_doc, base_map = None, {}
 
 
+def old_version_pages() -> list[int]:
+    """이전 번역본에서 개선 전 방식(나눔고딕 시절, 2026-10-11 이전)으로 만든 쪽 번호."""
+    out = []
+    for pno, idxs in base_map.items():
+        if any("Nanum" in f[3] for i in idxs for f in base_doc[i].get_fonts()) and not cached_ok(pages[pno - 1]):
+            out.append(pno)
+    return sorted(out)
+
+
 def has_translation(pg: dict) -> bool:
     return cached_ok(pg) or pg["page_number"] in base_map
 
@@ -682,7 +691,20 @@ if st.button("번역 시작", type="primary", disabled=not todo,
     run_translation(todo)
 
 # ── 쪽별로 다시 번역: 마음에 안 드는 쪽만 새로 번역해 이전 번역본과 합친다 ──
-with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool(base_map) and not todo):
+old_pages = old_version_pages() if base_doc is not None else []
+with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool(base_map) and (not todo or bool(old_pages))):
+    if old_pages:
+        olds = [pages[k - 1] for k in old_pages if pages[k - 1]["mode"] == "text"]
+        oc = sum(len(core.plain(h)) for pg in olds for *_, h in units_of(pg))
+        ok = engines.openai_cost_krw(model, oc) if engine_name == "OpenAI" else None
+        if ok is not None:
+            ok += (engines.figure_cost_krw(model, sum(len(core.figure_jobs(pg)) for pg in olds)) or 0) \
+                + (engines.scan_check_cost_krw(model, sum(1 for pg in olds if pg.get("ocr"))) or 0)
+        st.warning(f"이전 번역본 중 **{len(old_pages)}쪽**은 개선 전 방식(쪽 경계 문장 이동, 표·그림 처리 이전)으로 "
+                   "만든 쪽입니다. 이 쪽들은 이번 개선이 반영되지 않았으니 다시 번역하는 것을 권합니다.")
+        if st.button(f"개선 전 방식 쪽 모두 다시 번역 ({len(olds)}쪽" +
+                     (f", 약 {ok:,}원)" if ok is not None else ")"), type="primary"):
+            run_translation(olds)
     if base_map:
         src_name = st.session_state.get("base_src") or "올린 파일"
         st.caption(f"이전 번역본({src_name})에서 {len(base_map)}쪽을 그대로 가져옵니다. "
