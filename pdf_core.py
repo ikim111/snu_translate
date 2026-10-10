@@ -990,6 +990,9 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
         for b in blocks:
             if b["kind"] in ("para", "note", "footnote") and len(b.get("lines") or []) >= 2 and b.get("html"):
                 b["html"] = re.sub(r"<b>(\S+)</b>", r"\1", b["html"])
+            elif b["kind"] in ("heading", "caption") and b.get("html"):
+                # 제목·캡션은 짧은 단어(in, of)가 가늘게 읽혀 굵기가 섞인다 → 일부만 굵게 하지 않는다
+                b["html"] = re.sub(r"</?b>", "", b["html"])
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
     _carry_across_columns(ordered, page.rect)
