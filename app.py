@@ -427,8 +427,9 @@ done_in_range = sum(1 for pg in sel if has_translation(pg))
 if engine_name == "OpenAI":
     krw = engines.openai_cost_krw(model, need_chars)
     n_figs = sum(len(core.figure_jobs(pg)) for pg in todo)
-    krw_f = engines.figure_cost_krw(model, n_figs) if translate_captions else 0
-    cost = (f" · 예상 비용 약 {krw + (krw_f or 0):,}원" + (f" (그림 {n_figs}개 글자 읽기 포함)" if n_figs and krw_f else "")
+    krw_f = (engines.figure_cost_krw(model, n_figs) if translate_captions else 0) or 0
+    krw_f += engines.scan_check_cost_krw(model, sum(1 for pg in todo if pg.get("ocr"))) or 0
+    cost = (f" · 예상 비용 약 {krw + krw_f:,}원" + (" (그림 글자 읽기·스캔 쪽 이미지 확인 포함)" if krw_f else "")
             if krw is not None else "")
 else:
     cost = " (DeepL 남은 한도는 번역 시작 시 확인해 보여 줍니다)"
@@ -526,8 +527,11 @@ def figure_pngs(pg: dict) -> dict[str, bytes]:
         page = core._ROT_DOCS[pg["_rot_key"]][0]
     else:
         page = src[pg["page_number"] - 1]
-    return {core.fig_key(b): page.get_pixmap(clip=b["bbox"], dpi=engines.FIG_DPI).tobytes("png")
-            for _, b in core.figure_jobs(pg)}
+    out = {core.fig_key(b): page.get_pixmap(clip=b["bbox"], dpi=engines.FIG_DPI).tobytes("png")
+           for _, b in core.figure_jobs(pg)}
+    if pg.get("ocr"):
+        out["page"] = page.get_pixmap(dpi=engines.SCAN_DPI).tobytes("png")
+    return out
 
 
 def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
@@ -540,7 +544,20 @@ def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
     reviews: list[dict] = []
     if units:
         meta = core.unit_meta(all_pages, pg, units)
-        tr = engine.translate([h for *_, h in units], meta)
+        htmls = [h for *_, h in units]
+        # 스캔 쪽: 쪽 이미지와 OCR 글을 대조해 기울임(→ 굵게+밑줄)과 OCR 오류를 번역 전에 반영
+        if engine_name == "OpenAI" and pg.get("ocr") and "page" in pngs:
+            chk = engines.scan_check(api_key, model, pngs["page"],
+                                     [{"id": m["id"], "text": core.plain(h)} for m, h in zip(meta, htmls)])
+            by_id: dict[str, dict] = {}
+            for it in chk.get("italics", []):
+                by_id.setdefault(it["id"], {"i": [], "f": []})["i"].append(it["phrase"])
+            for fx in chk.get("fixes", []):
+                by_id.setdefault(fx["id"], {"i": [], "f": []})["f"].append((fx["ocr"], fx["image"]))
+                reviews.append({"id": fx["id"], "review": f'OCR 교정(쪽 이미지 확인): "{fx["ocr"]}" → "{fx["image"]}"'})
+            htmls = [core.apply_scan_check(h, by_id.get(m["id"], {}).get("i", []), by_id.get(m["id"], {}).get("f", []))
+                     for m, h in zip(meta, htmls)]
+        tr = engine.translate(htmls, meta)
         reviews = [{"id": m["id"], "review": m.get("review", "")} for m in meta
                    if m.get("status") == "needs_review" or m.get("review")]
     figs: dict = {}
@@ -657,6 +674,8 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
         krw2 = engines.openai_cost_krw(model, rc) if engine_name == "OpenAI" else None
         if krw2 is not None and translate_captions:
             krw2 += engines.figure_cost_krw(model, sum(len(core.figure_jobs(pg)) for pg in redo)) or 0
+        if krw2 is not None:
+            krw2 += engines.scan_check_cost_krw(model, sum(1 for pg in redo if pg.get("ocr"))) or 0
         st.caption(f"{len(redo)}쪽 · 원문 약 {rc:,}자" + (f" · 예상 비용 약 {krw2:,}원" if krw2 is not None else ""))
     if st.button("이 쪽만 다시 번역", disabled=not redo):
         run_translation(redo)

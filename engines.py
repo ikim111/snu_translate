@@ -769,3 +769,75 @@ def figure_cost_krw(model: str, n_figs: int) -> int | None:
         return None
     _, pin, pout = OPENAI_MODELS[model]
     return round(n_figs * (1_500 / 1e6 * pin + 600 / 1e6 * pout) * USD_KRW)
+
+
+# ─────────────────────────── 스캔 쪽 이미지 확인 (기울임·OCR 오류) ───────────────────────────
+SCAN_DPI = 150
+SCAN_PROMPT = """당신은 영어 학술 논문 스캔 쪽 이미지와, 그 쪽에서 OCR로 읽은 글 조각들을 대조하는 교정자다.
+입력: 쪽 이미지 1장과 JSON {"segments": [{"id", "text"}]}. text는 OCR 결과다.
+
+1. italics: 이미지에서 기울임꼴(italic)로 인쇄된 구절을 조각마다 찾아, text에 나오는 철자 그대로 적는다.
+   - 의미 강조, 용어 소개, 책·학술지 제목, 소제목 첫머리(run-in heading) 등 기울임이면 모두 포함한다.
+   - 단, 통계 기호·변수(M, SD, p, n, N, t, F, r)처럼 한두 글자 기호는 넣지 않는다.
+   - 조각 전체가 기울임이면(예: 초록 전체, 그림 번호) 넣지 않는다.
+2. fixes: OCR이 이미지와 다르게 읽은 곳을 찾는다(잘린 단어, 붙은 단어, 잘못 읽은 숫자·기호·글자).
+   ocr에는 text에 나오는 틀린 부분을 그대로, image에는 이미지에서 확실히 보이는 글자를 적는다.
+   이미지에서도 확실하지 않으면 고치지 말고 넣지 않는다. 원문에 실제로 인쇄된 오탈자는 고치지 않는다.
+추측하지 않는다. 해당 사항이 없으면 빈 목록을 반환한다."""
+
+SCAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "italics": {"type": "array", "items": {
+            "type": "object", "properties": {"id": {"type": "string"}, "phrase": {"type": "string"}},
+            "required": ["id", "phrase"], "additionalProperties": False}},
+        "fixes": {"type": "array", "items": {
+            "type": "object", "properties": {"id": {"type": "string"}, "ocr": {"type": "string"},
+                                             "image": {"type": "string"}},
+            "required": ["id", "ocr", "image"], "additionalProperties": False}},
+    },
+    "required": ["italics", "fixes"], "additionalProperties": False,
+}
+
+
+def scan_check(api_key: str, model: str, png: bytes, segs: list[dict]) -> dict:
+    """스캔 쪽 이미지 + OCR 조각 → {"italics": [{id, phrase}], "fixes": [{id, ocr, image}]}."""
+    import openai
+
+    client = openai.OpenAI(api_key=api_key.strip(), max_retries=3, timeout=240)
+    url = "data:image/png;base64," + base64.b64encode(png).decode()
+    kw: dict[str, Any] = dict(
+        model=model,
+        instructions=SCAN_PROMPT,
+        input=[{"role": "user", "content": [
+            {"type": "input_text", "text": json.dumps({"segments": segs}, ensure_ascii=False)},
+            {"type": "input_image", "image_url": url, "detail": "high"},
+        ]}],
+        text={"format": {"type": "json_schema", "name": "scan_check", "schema": SCAN_SCHEMA, "strict": True}},
+    )
+    try:
+        try:
+            resp = client.responses.create(reasoning={"effort": "low"}, **kw)
+        except openai.BadRequestError as e:
+            if "reasoning" not in str(e):
+                raise
+            resp = client.responses.create(**kw)
+        return json.loads(resp.output_text)
+    except openai.AuthenticationError:
+        raise EngineError("API Key 오류: OpenAI 키가 올바르지 않습니다.", fatal=True)
+    except openai.RateLimitError as e:
+        if "insufficient_quota" in str(e):
+            raise EngineError("OpenAI 크레딧 부족: platform.openai.com에서 충전하세요.", fatal=True)
+        raise EngineError("요청이 너무 많음 — 잠시 후 다시 시도하세요.")
+    except openai.OpenAIError as e:
+        raise EngineError(f"스캔 쪽 확인 실패: {e}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise EngineError(f"스캔 쪽 확인 결과 형식 오류: {e}")
+
+
+def scan_check_cost_krw(model: str, n_pages: int) -> int | None:
+    """쪽당 이미지 약 1,600토큰 + 조각 글 약 1,000토큰 입력, 출력 약 400토큰으로 거칠게 추정."""
+    if model not in OPENAI_MODELS:
+        return None
+    _, pin, pout = OPENAI_MODELS[model]
+    return round(n_pages * (2_600 / 1e6 * pin + 400 / 1e6 * pout) * USD_KRW)

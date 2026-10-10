@@ -997,7 +997,8 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
     ordered = _merge_continuations(ordered)
     _carry_across_columns(ordered, page.rect)
     ordered = _merge_caption_tail(_merge_headings(ordered))
-    return {"mode": "text", "body_size": body, "blocks": _split_byline(ordered, page.rect)}
+    return {"mode": "text", "body_size": body, "blocks": _split_byline(ordered, page.rect),
+            "ocr": bool(raw.get("_reocr"))}
 
 
 TITLE_CASE_SMALL = {"a", "an", "the", "of", "and", "or", "in", "on", "for", "to", "by", "with", "from", "at", "as"}
@@ -1186,6 +1187,7 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
         if b["kind"] not in ("figure", "table") and 0 < len(t) <= 8 and len(set(t)) <= 2 and not any(ch.isdigit() for ch in t):
             b["kind"] = "header"                 # 괘선을 글자로 잘못 읽은 잡음('eee', '———')
             b["noise"] = True
+            b["title"] = False
     texty = [b for b in blocks if b["kind"] not in ("figure", "table")]
     for b in texty:
         r = b["bbox"]
@@ -1599,7 +1601,8 @@ def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
         pg["page_number"] = i + 1
         pages.append(pg)
     # 논문 첫 쪽(제목이 있는 쪽, 보통 1쪽이지만 JSTOR 표지가 있으면 2쪽): 위쪽 저널 정보는 지우지 않고 보존
-    tsz = [max((b["size"] for b in p.get("blocks", []) if b.get("title")), default=0) for p in pages[:3]]
+    tsz = [max((b["size"] for b in p.get("blocks", []) if b.get("title") and b["kind"] == "heading"), default=0)
+           for p in pages[:3]]
     ti = max(range(len(tsz)), key=lambda i: tsz[i]) if tsz and max(tsz) > 0 else 0
     if ti and pages[ti]["mode"] == "text":
         for b in pages[ti]["blocks"]:
@@ -1610,9 +1613,11 @@ def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
         rest = [b for b in pages[ti]["blocks"] if b["kind"] != "meta"]
         heads = [b for b in rest if b["kind"] == "header"]
         pages[ti]["blocks"] = heads + metas + [b for b in rest if b["kind"] != "header"]
-    if pages and pages[0]["mode"] == "text":
+    if pages and pages[0]["mode"] == "text" and tsz and tsz[0] > 0 and ti == 0:
+        # 논문 첫 쪽이 1쪽이면 위·아래의 저널 정보(학술지명, DOI 등)를 보존. 다운로드 안내·잡음·쪽 번호는 제외
         for b in pages[0]["blocks"]:
             if b["kind"] == "header" and not re.fullmatch(r"\s*\d{1,4}\s*", b["text"]) and \
+                    not b.get("noise") and not DOWNLOAD_NOTICE_RE.search(b["text"]) and \
                     b["bbox"].y1 < pages[0].get("_h", 1e9):
                 b["kind"] = "meta"
         metas = [b for b in pages[0]["blocks"] if b["kind"] == "meta"]
@@ -2338,3 +2343,20 @@ def apply_figure_translations(pg: dict, figs: dict) -> None:
             b["review"] = " / ".join(f["review"])
         elif "review" in b:
             del b["review"]
+
+
+def apply_scan_check(html: str, italics: list[str], fixes: list[tuple[str, str]]) -> str:
+    """스캔 쪽 이미지 확인 결과를 번역 전 원문 조각에 반영한다.
+    fixes: OCR이 틀린 글자 → 이미지에서 확인한 글자. italics: 이미지에서 기울임으로 보이는 구절 → <i>."""
+    for wrong, right in fixes:
+        if wrong and right and wrong in html:
+            html = html.replace(wrong, esc(right), 1)
+    for ph in sorted(set(italics), key=len, reverse=True):
+        ph_e = esc(ph)
+        if len(ph.strip()) < 2 or f"<i>{ph_e}</i>" in html:
+            continue
+        # 태그 밖에서 처음 나오는 곳만 감싼다
+        m = re.search(r"(?<![\w>])" + re.escape(ph_e) + r"(?![\w<])", html)
+        if m and html.rfind("<", 0, m.start()) <= html.rfind(">", 0, m.start()):
+            html = html[: m.start()] + f"<i>{ph_e}</i>" + html[m.end():]
+    return html
