@@ -544,6 +544,13 @@ def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
     if chars < 200:
         return None
     _fix_drop_caps(raw)
+    # 괘선·테두리를 글자로 읽은 조각('—_', '___') 제거
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                t = "".join(c["c"] for c in sp["chars"]).strip()
+                if t and re.fullmatch(r"[—_~\-]*_[—_~\-]*", t):
+                    sp["chars"] = [c for c in sp["chars"] if c["c"].isspace()]
     # tesseract 단어 = span. 단어 사이 공백이 빠진 곳('article'+'focuses')에 공백을 넣는다
     for b in raw["blocks"]:
         for l in b.get("lines", []):
@@ -883,7 +890,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             block_lines.append((pymupdf.Rect(b["bbox"]), lines))
 
     figs = _grow_figures(figs, block_lines, page.rect)
-    blocks: list[dict[str, Any]] = [_figure_block(r, block_lines, body) for r in figs]
+    blocks: list[dict[str, Any]] = [_figure_block(r, raw, body) for r in figs]
 
     def in_fig(r: pymupdf.Rect) -> bool:
         c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
@@ -1013,48 +1020,108 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
             if len(text) > 45 or CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) \
                     or bbox.y1 < 62 or bbox.y0 > H - 70:
                 continue
-            for f in figs:
+            for fi, f in enumerate(figs):
                 if f.contains(bbox):
                     break
                 near = pymupdf.Rect(f.x0 - 8, f.y0 - 8, f.x1 + 8, f.y1 + 8)
                 xov = min(bbox.x1, f.x1) - max(bbox.x0, f.x0)
                 if near.intersects(bbox) and xov >= bbox.width * 0.6:
-                    f |= bbox
+                    figs[fi] = pymupdf.Rect(f) | bbox
                     taken.add(k)
                     changed = True
                     break
     return figs
 
 
-def _figure_block(r: pymupdf.Rect, block_lines: list, body: float) -> dict[str, Any]:
-    """그림 블록. 그림 안의 글자(범주명·범례·도식 상자 글자)는 묶어서 번역 대상으로 둔다
-    (그림은 원본 그대로 두고, 같은 쪽에 '원문 → 번역' 대응표로 보여 준다). 숫자·눈금은 제외."""
-    lines = [l for _, ls in block_lines for l in ls
-             if r.contains(pymupdf.Point((l["bbox"].x0 + l["bbox"].x1) / 2, (l["bbox"].y0 + l["bbox"].y1) / 2))
-             and not CAPTION_RE.match(l["text"].strip())]
-    lines.sort(key=lambda l: (l["bbox"].y0, l["bbox"].x0))
-    groups: list[list[dict]] = []
-    for l in lines:
+FIG_NUMBERISH_RE = re.compile(r"\(\s*[nN]\s*=|%")
+
+
+def _figure_block(r: pymupdf.Rect, raw: dict, body: float) -> dict[str, Any]:
+    """그림 블록. 그림 안의 글자(범주명·범례·도식 상자 글자)는 단어 단위로 모아 문구로 묶고
+    번역 대상으로 둔다 (그림은 원본 그대로, 같은 쪽에 '원문 | 번역' 대응표). 숫자·눈금·'82%(n=37)'은 제외."""
+    words: list[tuple[pymupdf.Rect, str]] = []
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            if abs(l["dir"][0] - 1) > 0.01:
+                continue
+            for sp in l["spans"]:
+                cur: list[dict] = []
+                for ch in sp["chars"] + [{"c": " ", "bbox": (0, 0, 0, 0)}]:
+                    if ch["c"].isspace():
+                        if cur:
+                            bb = pymupdf.Rect(cur[0]["bbox"])
+                            for x in cur[1:]:
+                                bb |= pymupdf.Rect(x["bbox"])
+                            if r.contains(pymupdf.Point((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2)):
+                                words.append((bb, "".join(x["c"] for x in cur)))
+                        cur = []
+                    else:
+                        cur.append(ch)
+    words.sort(key=lambda w: ((w[0].y0 + w[0].y1) / 2, w[0].x0))
+    # 1) 같은 줄에서 가까운 단어끼리 → 줄 조각
+    rows: list[list] = []
+    for w in words:
+        yc = (w[0].y0 + w[0].y1) / 2
+        if rows and abs(rows[-1][0][0].y0 + rows[-1][0][0].y1 - 2 * yc) / 2 < w[0].height * 0.5:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+    runs: list[list] = []                      # [단어 목록]
+    for row in rows:
+        row.sort(key=lambda w: w[0].x0)
+        for w in row:
+            if runs and runs[-1][-1] in row and 0 <= w[0].x0 - runs[-1][-1][0].x1 < max(w[0].height, 1) * 0.6:
+                runs[-1].append(w)
+            else:
+                runs.append([w])
+
+    def span(ws: list) -> pymupdf.Rect:
+        r_ = pymupdf.Rect(ws[0][0])
+        for w in ws[1:]:
+            r_ |= w[0]
+        return r_
+
+    # 범주명은 보통 가운데 정렬: 붙어 읽힌 이웃 범주('performance'+'pressure for')는 위아래 줄의 가운데와 맞춰 나눈다
+    def centers_except(run: list) -> list[float]:
+        return [(span(o).x0 + span(o).x1) / 2 for o in runs if o is not run]
+
+    out_runs: list[list] = []
+    for run in runs:
+        cs = centers_except(run)
+        whole = (span(run).x0 + span(run).x1) / 2
+        best = None
+        if len(run) > 1 and not any(abs(whole - c_) < 6 for c_ in cs):
+            for k in range(1, len(run)):
+                a_, b_ = span(run[:k]), span(run[k:])
+                if any(abs((a_.x0 + a_.x1) / 2 - c_) < 6 for c_ in cs) and \
+                        any(abs((b_.x0 + b_.x1) / 2 - c_) < 6 for c_ in cs):
+                    best = k
+                    break
+        out_runs += [run[:best], run[best:]] if best else [run]
+    pieces = [[span(r_), " ".join(w[1] for w in r_)] for r_ in out_runs]
+    # 2) 위아래로 붙고 가운데가 맞는 줄 조각 → 한 문구 (여러 줄 범주명)
+    pieces.sort(key=lambda p: (p[0].y0, p[0].x0))
+    groups: list[list] = []
+    for bb, t in pieces:
         for g in groups:
-            last = g[-1]["bbox"]
-            xov = min(l["bbox"].x1, last.x1) - max(l["bbox"].x0, last.x0)
-            if 0 <= l["bbox"].y0 - last.y1 <= l["bbox"].height * 0.8 and xov > 0:
-                g.append(l)
+            gb = g[0]
+            xov = min(bb.x1, gb.x1) - max(bb.x0, gb.x0)
+            if -bb.height * 0.5 <= bb.y0 - gb.y1 <= bb.height * 0.9 and xov > min(bb.width, gb.width) * 0.5:
+                g[0] = gb | bb
+                g[1] += " " + t
                 break
         else:
-            groups.append([l])
+            groups.append([pymupdf.Rect(bb), t])
+    groups.sort(key=lambda g: (round(g[0].y0 / 12), g[0].x0))
     items, boxes = [], []
-    for g in groups:
-        text = " ".join(l["text"].strip() for l in g)
-        if NUMERIC_LABEL_RE.match(text) or len(re.findall(r"[A-Za-z]", text)) < 2:
+    for bb, t in groups:
+        t = t.strip()
+        if NUMERIC_LABEL_RE.match(t) or FIG_NUMBERISH_RE.search(t) or len(re.findall(r"[A-Za-z]", t)) < 2 \
+                or CAPTION_RE.match(t):
             continue
-        html, _ = join_lines(g)
-        items.append(_protect(html))
-        bb = pymupdf.Rect(g[0]["bbox"])
-        for l in g[1:]:
-            bb |= l["bbox"]
+        items.append(_protect(esc(t)))
         boxes.append(bb)
-    return {"kind": "figure", "bbox": r, "size": body, "html": "", "text": "\n".join(c for c in items),
+    return {"kind": "figure", "bbox": r, "size": body, "html": "", "text": "\n".join(items),
             "items": items, "item_boxes": boxes}
 
 
@@ -1066,8 +1133,13 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
     figs = [b["bbox"] for b in blocks if b["kind"] in ("figure", "table")]
     for b in blocks:
         if b["kind"] in ("para", "note", "heading") and CAPTION_RE.match(b["text"]) and any(
-                -4 <= b["bbox"].y0 - f.y1 <= 20 or -4 <= f.y0 - b["bbox"].y1 <= 20 for f in figs):
+                -4 <= b["bbox"].y0 - f.y1 <= 40 or -4 <= f.y0 - b["bbox"].y1 <= 40 for f in figs):
             b["kind"] = "caption"
+    for b in blocks:
+        t = b.get("text", "").replace(" ", "")
+        if b["kind"] not in ("figure", "table") and 0 < len(t) <= 8 and len(set(t)) <= 2 and not any(ch.isdigit() for ch in t):
+            b["kind"] = "header"                 # 괘선을 글자로 잘못 읽은 잡음('eee', '———')
+            b["noise"] = True
     texty = [b for b in blocks if b["kind"] not in ("figure", "table")]
     for b in texty:
         r = b["bbox"]
@@ -1359,7 +1431,19 @@ def mark_references(pages: list[dict]) -> None:
                                    "html": _protect(h), "text": p})
             ref_lines.clear()
 
+        paras = [b for b in pg["blocks"] if b["kind"] in ("para", "note", "footnote") and b.get("bbox") is not None]
+        mid = (min(b["bbox"].x0 for b in paras) + max(b["bbox"].x1 for b in paras)) / 2 if paras else 0
+        right_edge = max((b["bbox"].x1 for b in paras), default=0)
         for b in pg["blocks"]:
+            # 오른쪽 정렬 짧은 줄('Manuscript received …')은 참고문헌 항목이 아니다
+            if in_refs and b["kind"] in ("para", "note") and b.get("bbox") is not None \
+                    and len(b.get("lines") or []) <= 2 and b["bbox"].x0 > mid + 20 \
+                    and abs(b["bbox"].x1 - right_edge) < 6 and len(b["text"]) < 90 \
+                    and not re.match(r"^[A-Z][A-Za-z'’\-]+,\s+[A-Z]\.", b["text"]):
+                flush()
+                b["right"] = True
+                new_blocks.append(b)
+                continue
             if b["kind"] in ("heading", "para", "note") and REF_HEAD_RE.match(b["text"].strip()):
                 b["kind"] = "heading"
                 in_refs = True
@@ -1468,6 +1552,17 @@ def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
             pg = {"mode": "error", "body_size": 10.0, "blocks": [], "error": str(e)}
         pg["page_number"] = i + 1
         pages.append(pg)
+    # 논문 첫 쪽(제목이 있는 쪽, 보통 1쪽이지만 JSTOR 표지가 있으면 2쪽): 위쪽 저널 정보는 지우지 않고 보존
+    ti = next((i for i, p in enumerate(pages[:3]) if any(b.get("title") for b in p.get("blocks", []))), 0)
+    if ti and pages[ti]["mode"] == "text":
+        for b in pages[ti]["blocks"]:
+            if b["kind"] == "header" and not DOWNLOAD_NOTICE_RE.search(b["text"]) and not b.get("noise") \
+                    and not re.fullmatch(r"\s*\d{1,4}\s*", b["text"]) and b["bbox"].y1 < 100:
+                b["kind"] = "meta"
+        metas = [b for b in pages[ti]["blocks"] if b["kind"] == "meta"]
+        rest = [b for b in pages[ti]["blocks"] if b["kind"] != "meta"]
+        heads = [b for b in rest if b["kind"] == "header"]
+        pages[ti]["blocks"] = heads + metas + [b for b in rest if b["kind"] != "header"]
     if pages and pages[0]["mode"] == "text":
         for b in pages[0]["blocks"]:
             if b["kind"] == "header" and not re.fullmatch(r"\s*\d{1,4}\s*", b["text"]) and \
@@ -1548,6 +1643,7 @@ body {{ color: #111; }}
 p {{ margin: 0 0 0.22em 0; line-height: {{LH}}; text-align: left; }}
 p.para {{ text-indent: 1em; }}
 p.center {{ text-align: center; }}
+p.right {{ text-align: right; font-size: 0.9em; margin: 0; }}
 p.byline {{ text-align: center; font-size: 0.9em; line-height: 1.3; margin: 0; }}
 p.byname {{ text-align: center; font-size: 0.95em; font-weight: bold; line-height: 1.3; margin: 0.35em 0 0 0; }}
 p.abstract {{ font-size: 0.95em; margin: 0.9em 1.6em 0.9em 1.6em; text-indent: 0; }}
@@ -1629,6 +1725,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
                 cls = "abstract"
             elif b.get("quote"):
                 cls = "quote"
+            elif b.get("right"):
+                cls = "right"
             out.append(f'<p class="{cls}">{to_reading_html(tr)}</p>')
         elif k == "list":
             items = b.get("tr_items") or b["items"]

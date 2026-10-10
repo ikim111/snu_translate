@@ -110,11 +110,20 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             return any(any(ch.isdigit() for ch in c["text"]) for c in r if col_of(c) != 0)
 
         # 첫 데이터 행: 숫자 칸이 있는 첫 행 (숫자 표가 아니면 첫 후보 행)
-        numeric_table = sum(has_num(r) for r in ranged if data_like(r)) >= 3
+        numeric_table = sum(has_num(r) for r in ranged if data_like(r)) >= 2
         first = next((k for k, r in enumerate(ranged) if data_like(r) and (has_num(r) or not numeric_table)), None)
         if first is None:
             i = j + 1
             continue
+        # 첫 데이터 행의 행 머리글이 위 줄에서 시작했으면('No or few explanations/' + 'justifications …') 그 줄부터
+        while first - 1 >= 0:
+            r, cur = ranged[first - 1], ranged[first]
+            c0 = [c for c in cur if col_of(c) == 0]
+            if len(r) == 1 and col_of(r[0]) == 0 and c0 and c0[0]["text"].strip()[:1].islower() \
+                    and cur[0]["_yc"] - r[0]["_yc"] <= r[0]["size"] * 1.8:
+                first -= 1
+            else:
+                break
         # 위로: 여러 줄 머리행(첫 열 밖에도 칸이 있는 행)을 모은다. 첫 열에만 있는 한 줄은 표 제목이라 멈춘다
         top = first
         while top - 1 >= 0:
@@ -213,6 +222,20 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
         if merged and only0 and all(texts[i].lstrip().startswith("(") for i in r[0]):
             merged[-1][0] += r[0]
             continue
+        merged.append(r)
+    grid = merged
+    # 여러 줄 행 머리글의 첫 줄('No or few explanations/')만 있는 행은 다음 행 머리글 앞에 붙인다
+    merged = []
+    pending: list[int] = []
+    for k, r in enumerate(grid):
+        only0 = r[0] and not any(r[1:])
+        nxt = grid[k + 1] if k + 1 < len(grid) else None
+        if only0 and nxt and nxt[0] and texts[nxt[0][0]][:1].islower():
+            pending += r[0]
+            continue
+        if pending:
+            r = [pending + r[0]] + r[1:]
+            pending = []
         merged.append(r)
     grid = merged
 
