@@ -283,6 +283,14 @@ def table_pieces(block: dict, to_html, box_width: float = 560.0) -> list[str]:
     if lay.get("super") is not None:
         head += (f'<tr><th style="width:{widths[0]:.0f}pt"></th>'
                  f'<th colspan="{len(widths) - 1}" class="sup">{get(lay["super"])}</th></tr>')
+    if lay.get("group_row"):
+        cells = [f'<th style="width:{widths[0]:.0f}pt"></th>']
+        k = 1
+        for idx, span in lay["group_row"]:
+            w = sum(widths[k:k + span]) + 6 * (span - 1)
+            cells.append(f'<th colspan="{span}" class="sup" style="width:{w:.0f}pt">{get(idx)}</th>')
+            k += span
+        head += "<tr>" + "".join(cells) + "</tr>"
     if any(h is not None for h in lay["header"]):
         head += "<tr>" + "".join(f'<th style="width:{w:.0f}pt">{get(h)}</th>'
                                  for h, w in zip(lay["header"], widths)) + "</tr>"
@@ -294,7 +302,8 @@ def table_pieces(block: dict, to_html, box_width: float = 560.0) -> list[str]:
                            for i in idxs)
             src_txt = " ".join(re.sub(r"<[^>]+>", "", block["items"][i]) for i in idxs).strip()
             num = c > 0 and bool(re.fullmatch(r"[\d\s.,%()=<>+\-–—/n*]*", src_txt))
-            cells.append(f'<td class="{"num" if num else ""}" style="width:{w:.0f}pt">{body}</td>')
+            cls = "num" if num else ("short" if 0 < len(src_txt) <= 10 else "")
+            cells.append(f'<td class="{cls}" style="width:{w:.0f}pt">{body}</td>')
         cls = "tbl first" if r == 0 else "tbl"
         if r == len(lay["rows"]) - 1:
             cls += " last"

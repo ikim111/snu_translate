@@ -997,6 +997,10 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
     ordered = _merge_continuations(ordered)
     _carry_across_columns(ordered, page.rect)
     ordered = _merge_caption_tail(_merge_headings(ordered))
+    if raw.get("_reocr"):
+        for b in ordered:
+            if b["kind"] in ("heading", "caption") and b.get("html"):
+                b["html"] = re.sub(r"</?b>", "", b["html"])
     return {"mode": "text", "body_size": body, "blocks": _split_byline(ordered, page.rect),
             "ocr": bool(raw.get("_reocr"))}
 
@@ -1013,6 +1017,16 @@ def _is_title_case(t: str) -> bool:
 NUMERIC_LABEL_RE = re.compile(r"^[\d\s.,%()=<>+\-–—/:*n]*$")
 
 
+def _is_prose(lines: list[dict]) -> bool:
+    """본문 문장처럼 보이는지: 소문자 단어가 많은 긴 줄이 둘 이상."""
+    n = 0
+    for l in lines:
+        words = re.findall(r"[a-z]{2,}", l["text"])
+        if len(words) >= 6:
+            n += 1
+    return n >= 2
+
+
 def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupdf.Rect) -> list[pymupdf.Rect]:
     """그림 가장자리에 붙은 짧은 글자(축 눈금 '100%', 막대 위 '82%(n=37)', 범주명)가 그림 밖으로
     빠지지 않게 그림 영역을 넓힌다. 캡션·쪽 머리글 띠·긴 본문은 넣지 않는다."""
@@ -1026,8 +1040,17 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
             if k in taken:
                 continue
             text = " ".join(l["text"].strip() for l in lines)
-            if len(text) > 45 or CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) \
-                    or bbox.y1 < 62 or bbox.y0 > H - 70:
+            if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or bbox.y1 < 62 or bbox.y0 > H - 70:
+                continue
+            # 그림 높이 안에 통째로 들어 있는 '문장이 아닌' 글(나란히 놓인 다른 그래프의 눈금·범주명)
+            inside = next((fi for fi, f in enumerate(figs) if bbox.y0 >= f.y0 - 4 and bbox.y1 <= f.y1 + 4
+                           and not f.contains(bbox) and not _is_prose(lines)), None)
+            if inside is not None:
+                figs[inside] = pymupdf.Rect(figs[inside]) | bbox
+                taken.add(k)
+                changed = True
+                continue
+            if len(text) > 45:
                 continue
             for fi, f in enumerate(figs):
                 if f.contains(bbox):
@@ -1180,7 +1203,7 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
     figs = [b["bbox"] for b in blocks if b["kind"] in ("figure", "table")]
     for b in blocks:
         if b["kind"] in ("para", "note", "heading") and CAPTION_RE.match(b["text"]) and any(
-                -4 <= b["bbox"].y0 - f.y1 <= 40 or -4 <= f.y0 - b["bbox"].y1 <= 40 for f in figs):
+                -4 <= b["bbox"].y0 - f.y1 <= 40 or -4 <= f.y0 - b["bbox"].y1 <= 60 for f in figs):
             b["kind"] = "caption"
     for b in blocks:
         t = b.get("text", "").replace(" ", "")
@@ -1200,8 +1223,30 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
             b["kind"] = "para"
         elif b["kind"] in ("para", "note") and len(b.get("lines", [])) == 1 and len(b["text"]) < 70 \
                 and not SENTENCE_END_RE.search(b["text"]) and _is_title_case(b["text"]) \
-                and not below and not above and b["size"] >= body * 0.8:
+                and b["size"] >= body * 0.8 and (not below or r.width < W * 0.5) \
+                and (not above or all(SENTENCE_END_RE.search(o["text"].rstrip()) for o in above)):
             b["kind"] = "heading"
+    # 문단 안의 번호 항목('(1) …', '(2) …')은 원문처럼 항목마다 나눈다
+    out_blocks: list[dict] = []
+    for b in blocks:
+        ls = b.get("lines") or []
+        starts = [i for i, l in enumerate(ls) if re.match(r"^\(?\d{1,2}[).]\s", l["text"].strip())
+                  and l["bbox"].x0 <= b["bbox"].x0 + 4] if b["kind"] == "para" else []
+        if len(starts) >= 2:
+            cuts = ([0] if starts[0] > 0 else []) + starts + [len(ls)]
+            for a_, z_ in zip(cuts, cuts[1:]):
+                part = ls[a_:z_]
+                h_, t_ = join_lines(part)
+                bb = pymupdf.Rect(part[0]["bbox"])
+                for l in part[1:]:
+                    bb |= l["bbox"]
+                nb = dict(b, html=_protect(h_), text=t_, lines=part, bbox=bb)
+                if a_ in starts:
+                    nb["item"] = True
+                out_blocks.append(nb)
+        else:
+            out_blocks.append(b)
+    blocks[:] = out_blocks
     # 한 단 쪽에서 좌우가 함께 들여 쓴 여러 줄 문단 = 긴 인용문
     paras = [b for b in blocks if b["kind"] == "para" and len(b.get("lines", [])) >= 3]
     if paras and sum(b["bbox"].width > W * 0.6 for b in paras) >= len(paras) * 0.6:
@@ -1297,7 +1342,8 @@ def _merge_continuations(blocks: list[dict]) -> list[dict]:
         if (prev and prev["kind"] == b["kind"] and b["kind"] in ("para", "note", "footnote")
                 and prev.get("lines") and b.get("lines")
                 and -2 <= b["bbox"].y0 - prev["bbox"].y1 <= b["size"] * 1.0
-                and (prev["text"].endswith("-") or b["text"][:1].islower())
+                and (prev["text"].endswith("-") or b["text"][:1].islower()
+                     or (b["text"][:1].isdigit() and not re.match(r"^\(?\d{1,2}[).]\s", b["text"])))
                 and not SENTENCE_END_RE.search(prev["text"])):
             h, t = join_lines(prev["lines"] + b["lines"])
             prev.update(html=_protect(h), text=t, lines=prev["lines"] + b["lines"])
@@ -1427,6 +1473,9 @@ def sort_reading_order(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict
 
 
 # ─────────────────────── 3. 참고문헌 ───────────────────────
+AUTHOR_START_RE = re.compile(r"^[A-Z][A-Za-z'’\-]+(?: [A-Z][A-Za-z'’\-]+)?,\s+(?:[A-Z]\.|[A-Z][a-z])")
+
+
 def mark_references(pages: list[dict]) -> None:
     """'REFERENCES' 제목 뒤부터 'APPENDIX' 전까지를 참고문헌으로 표시하고 항목 단위로 다시 나눈다.
 
@@ -1460,6 +1509,11 @@ def mark_references(pages: list[dict]) -> None:
             if not ref_lines:
                 return
             margin = min(l["x0"] for l in ref_lines)
+            # 오른쪽 정렬 짧은 줄('Manuscript received …', 'Accepted …')은 항목에서 떼어 둔다
+            right_x = max((l["bbox"].x1 for l in ref_lines if "bbox" in l), default=0)
+            tail = [l for l in ref_lines if "bbox" in l and l["x0"] > margin + (right_x - margin) * 0.35
+                    and len(l["text"].strip()) < 60 and not AUTHOR_START_RE.match(l["text"].strip())]
+            ref_lines[:] = [l for l in ref_lines if l not in tail]
             # 번호식 참고문헌([1] … / 1. …)이면 번호로 시작하는 줄에서만 새 항목
             numbered_style = sum(bool(re.match(r"^\s*(\[\d+\]|\d+\.)\s", l["text"])) for l in ref_lines) \
                 >= max(3, len(ref_lines) // 4)
@@ -1477,6 +1531,10 @@ def mark_references(pages: list[dict]) -> None:
                         r = pymupdf.Rect(ln["bbox"]) if r.is_empty else r | ln["bbox"]
                 new_blocks.append({"kind": "reference", "bbox": r, "size": e[0]["size"],
                                    "html": _protect(h), "text": p})
+            for l in tail:
+                new_blocks.append({"kind": "para", "bbox": pymupdf.Rect(l["bbox"]), "size": l["size"],
+                                   "html": _protect(l["html"].strip()), "text": l["text"].strip(),
+                                   "lines": [l], "right": True})
             ref_lines.clear()
 
         paras = [b for b in pg["blocks"] if b["kind"] in ("para", "note", "footnote") and b.get("bbox") is not None]
@@ -1500,6 +1558,8 @@ def mark_references(pages: list[dict]) -> None:
             if b["kind"] == "heading" and END_REF_RE.match(b["text"].strip()):
                 flush()
                 in_refs = False
+            if in_refs and b["kind"] == "heading" and AUTHOR_START_RE.match(b["text"].strip()) and b.get("lines"):
+                b["kind"] = "para"                 # 굵게 읽힌 첫 참고문헌 항목
             if in_refs and b["kind"] in ("para", "footnote", "note", "list") and b.get("lines"):
                 ref_lines.extend(b["lines"])
                 continue
@@ -1624,6 +1684,7 @@ def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
         rest = [b for b in pages[0]["blocks"] if b["kind"] != "meta"]
         heads = [b for b in rest if b["kind"] == "header"]
         pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
+    _restore_top_headings(pages)
     _assign_printed_numbers(pages)
     mark_references(pages)
     # 쪽 경계에서 끊긴 문장은 옮기지 않는다: 번역본 n쪽 = 원문 n쪽 내용 (원문 대조가 우선)
@@ -1692,6 +1753,7 @@ p {{ margin: 0 0 0.22em 0; line-height: {{LH}}; text-align: left; }}
 p.para {{ text-indent: 1em; }}
 p.center {{ text-align: center; }}
 p.right {{ text-align: right; font-size: 0.9em; margin: 0; }}
+p.item {{ margin: 0 0 0.22em 1.2em; text-indent: -1.2em; }}
 p.byline {{ text-align: center; font-size: 0.9em; line-height: 1.3; margin: 0; }}
 p.byname {{ text-align: center; font-size: 0.95em; font-weight: bold; line-height: 1.3; margin: 0.35em 0 0 0; }}
 p.abstract {{ font-size: 0.95em; margin: 0.9em 1.6em 0.9em 1.6em; text-indent: 0; }}
@@ -1721,7 +1783,8 @@ th {{ font-size: 0.86em; font-weight: bold; text-align: left; vertical-align: bo
       padding: 0.15em 0.3em; border-bottom: 0.7px solid #000; line-height: 1.22; }}
 th.sup {{ text-align: center; border-bottom: 0.4px solid #666; }}
 td {{ font-size: 0.86em; vertical-align: top; padding: 0.08em 0.3em; line-height: 1.24; }}
-td.num {{ text-align: center; }}
+td.num {{ text-align: center; white-space: nowrap; }}
+td.short {{ white-space: nowrap; }}
 td.rowh {{ font-weight: normal; }}
 table.last {{ border-bottom: 0.9px solid #000; }}
 p.ti {{ margin: 0 0 0.1em 0; padding-left: 0.8em; text-indent: -0.8em; text-align: left; line-height: 1.22; }}
@@ -1775,6 +1838,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
                 cls = "quote"
             elif b.get("right"):
                 cls = "right"
+            elif b.get("item"):
+                cls = "item"
             out.append(f'<p class="{cls}">{to_reading_html(tr)}</p>')
         elif k == "list":
             items = b.get("tr_items") or b["items"]
@@ -1814,6 +1879,27 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
 
 def _label_html(text: str) -> str:
     return f'<p style="text-align:right;color:#888;font-size:8pt;margin:0">{esc(text)}</p>'
+
+
+def _restore_top_headings(pages: list[dict]) -> None:
+    """쪽 위 머리글 구역에 있다는 이유로 머리글로 분류된 블록 중, 다른 쪽에 반복되지 않는
+    Title Case 짧은 줄은 소제목이다('Purpose of the Study'). 러닝 헤더는 여러 쪽에 반복된다."""
+    from collections import Counter
+
+    def norm(t: str) -> str:
+        return re.sub(r"[\d\W_]+", "", t).lower()
+
+    cnt: Counter = Counter()
+    for pg in pages:
+        for t in {norm(b["text"]) for b in pg.get("blocks", []) if b["kind"] == "header"}:
+            cnt[t] += 1
+    for pg in pages:
+        for b in pg.get("blocks", []):
+            if b["kind"] == "header" and not b.get("noise") and cnt[norm(b["text"])] <= 1 \
+                    and not DOWNLOAD_NOTICE_RE.search(b["text"]) and _is_title_case(b["text"]) \
+                    and len(b["text"]) < 70 and not SENTENCE_END_RE.search(b["text"]) \
+                    and b.get("bbox") is not None and b["bbox"].y0 > 55:
+                b["kind"] = "heading"
 
 
 def _page_number_candidates(blocks: list[dict]) -> list[int]:

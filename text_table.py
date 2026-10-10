@@ -152,34 +152,43 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             return min(range(len(groups)), key=lambda k: abs((groups[k][0] + groups[k][1]) / 2 - cx))
 
         # 머리행 위에 여러 열을 덮는 한 줄('Implementation')이 있으면 묶음 머리글
-        super_row = None
-        cand = ranged[top - 1] if top - 1 >= 0 else None
-        if cand is None:
-            k0 = next((k for k, r in enumerate(rows) if r is run[0]), 0)
-            cand = [c for c in rows[k0 - 1] if in_range(c)] if k0 > 0 else None
-        if cand and len(cand) == 1 and ranged[top][0]["_yc"] - cand[0]["_yc"] <= cand[0]["size"] * 2.6 \
-                and cand[0]["bbox"].x0 > groups[0][1]:
-            super_row = cand[0]
-        # 데이터 바로 위 머리행 줄이 열을 더 잘게 나누면(빈칸이 많은 표) 그 칸들을 열 기준으로 쓴다
-        if first - 1 >= top:
-            hdr = sorted(ranged[first - 1], key=lambda c: c["bbox"].x0)
-            if len(hdr) > len(groups) and all(hdr[k + 1]["bbox"].x0 > hdr[k]["bbox"].x1 for k in range(len(hdr) - 1)):
-                # 첫 열(행 머리글)은 데이터 칸 머리글보다 왼쪽에 있다: 기존 첫 그룹을 유지
-                left = [g for g in groups if g[1] < hdr[0]["bbox"].x0]
-                new = [list(g) for g in left] + [[c["bbox"].x0, c["bbox"].x1, 1] for c in hdr]
-                for k in range(len(new) - 1):            # 이웃 열과의 가운데까지 넓힌다
-                    mid = (new[k][1] + new[k + 1][0]) / 2
-                    new[k][1], new[k + 1][0] = max(new[k][1], mid - 0.01), min(new[k + 1][0], mid + 0.01)
-                groups[:] = new
-                col_x[:] = [g[0] for g in groups]
+        # 머리행 위에 여러 열을 덮는 줄('Implementation', '1990-1991' / 'Site 1')이 있으면 묶음 머리글
+        super_rows: list[dict] = []
+        k0 = next((k for k, r in enumerate(rows) if any(c.get("id") == ranged[top][0].get("id") for c in r)), None)
+        above = []
+        if top - 1 >= 0:
+            above = [ranged[k] for k in range(top - 1, -1, -1)]
+        if k0 is not None:
+            first_above = above[0] if above else None
+            k_start = k0 - 1
+            if first_above is not None:
+                pass
+            above = above + [[c for c in rows[k] if in_range(c)] for k in range(k_start, -1, -1)]
+        ref_y = ranged[top][0]["_yc"]
+        seen: set = set()
+        for cand in above:
+            if not cand:
+                continue
+            key = tuple(c.get("id") for c in cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(cand) != 1 or cand[0]["bbox"].x0 <= groups[0][1] \
+                    or ref_y - cand[0]["_yc"] > max(cand[0]["size"], ranged[top][0]["size"]) * 2.6 \
+                    or ref_y - cand[0]["_yc"] <= 0:
+                break
+            super_rows.insert(0, cand[0])
+            ref_y = cand[0]["_yc"]
+            if len(super_rows) >= 3:
+                break
         header_n = first - top          # 데이터 첫 행 위의 머리행 줄 수
-        tables.append(_build(table_rows, col_x, nearest, header_n, super_row))
+        tables.append(_build(table_rows, col_x, nearest, header_n, super_rows))
         i = j + 1
     return tables
 
 
 def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0,
-           super_row: dict | None = None) -> dict[str, Any]:
+           super_rows: list[dict] | None = None) -> dict[str, Any]:
     items: list[str] = []
     texts: list[str] = []
     ids: list[int] = []
@@ -202,8 +211,42 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
     def has_digit(cells: list[list[int]]) -> bool:
         return any(ch.isdigit() for cell in cells for i in cell for ch in texts[i])
 
+    # 한 줄 머리행의 칸이 여러 데이터 열을 덮으면('Teacher 1' → Obs. 2열) 묶음 머리행으로 (colspan)
+    group_row: list[tuple[int | None, int]] | None = None
+    if header_n == 1 and len(grid) >= 2:
+        hcells = sorted(rows[0], key=lambda c: c["bbox"].x0)
+        data_cx = [[] for _ in range(ncol)]
+        for r in rows[1:]:
+            for c in r:
+                k = col_of(c)
+                data_cx[k].append((c["bbox"].x0 + c["bbox"].x1) / 2)
+        cx = [sum(v) / len(v) if v else None for v in data_cx]
+        hcx = [(hc["bbox"].x0 + hc["bbox"].x1) / 2 for hc in hcells]
+        spans = [[] for _ in hcells]
+        for k in range(1, ncol):
+            if cx[k] is not None and hcells:
+                j = min(range(len(hcells)), key=lambda j: abs(hcx[j] - cx[k]))
+                spans[j].append(k)
+        # 머리 칸이 첫 열(행 이름) 위에 있으면 묶음이 아니다
+        if hcells and hcells[0]["bbox"].x1 < (cx[1] or 0) - 30:
+            spans = [[]]
+        if hcells and any(len(c) >= 2 for c in spans) and all(spans) and \
+                all(spans[i][-1] < spans[i + 1][0] for i in range(len(spans) - 1)):
+            group_row = []
+            col = 1
+            hidx = [i for r in grid[:1] for cell in r for i in cell]
+            hmap = {texts[i]: i for i in hidx}
+            for hc, cols in zip(hcells, spans):
+                if cols[0] > col:
+                    group_row.append((None, cols[0] - col))
+                group_row.append((hmap.get(hc["text"].strip()), len(cols)))
+                col = cols[-1] + 1
+            if col < ncol:
+                group_row.append((None, ncol - col))
+            grid = grid[1:]
+            header_n = 0
     header: list[int | None] = [None] * ncol
-    if header_n == 0 and len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
+    if header_n == 0 and group_row is None and len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
         header_n = 1
     if header_n:
         for c in range(ncol):
@@ -214,7 +257,12 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
                 header[c] = len(items) - 1
         grid = grid[header_n:]
 
-    sup = add(super_row) if super_row is not None else None
+    sup = None
+    if super_rows:
+        items.append(" · ".join(c["html"].strip() for c in super_rows))
+        texts.append(" · ".join(c["text"].strip() for c in super_rows))
+        ids.extend(c["id"] for c in super_rows)
+        sup = len(items) - 1
     # 행 머리글의 둘째 줄('(n = 26)')만 있는 행은 앞 행 머리글에 붙인다
     merged: list[list[list[int]]] = []
     for r in grid:
@@ -239,12 +287,12 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
         merged.append(r)
     grid = merged
 
-    all_cells = [c for r in rows for c in r] + ([super_row] if super_row is not None else [])
+    all_cells = [c for r in rows for c in r] + list(super_rows or [])
     x0 = min(c["bbox"].x0 for c in all_cells)
     x1 = max(c["bbox"].x1 for c in all_cells)
     bbox = pymupdf.Rect(x0, min(c["bbox"].y0 for c in all_cells), x1, max(c["bbox"].y1 for c in all_cells))
     size = sorted(c["size"] for c in all_cells)[len(all_cells) // 2]
-    layout = {"title": None, "super": sup, "header": header, "rows": grid, "note": None, "bulleted": [],
+    layout = {"title": None, "super": sup, "group_row": group_row, "header": header, "rows": grid, "note": None, "bulleted": [],
               "col_x": [x - x0 for x in col_x] + [x1 - x0], "width": x1 - x0}
     return {"kind": "table", "bbox": bbox, "size": size, "items": items, "layout": layout,
             "html": "", "text": "\n".join(texts), "line_ids": ids}
