@@ -362,10 +362,10 @@ if scan_pages:
     ocr_key = api_key if engine_name == "OpenAI" else secret("OPENAI_API_KEY")
     ocr_model = model if engine_name == "OpenAI" else getattr(engines, "DEFAULT_OPENAI_MODEL",
                                                                list(engines.OPENAI_MODELS)[0])
-    krw = engines.ocr_cost_krw(ocr_model, len(scan_pages))
+    krw = engines.ocr_cost_usd(ocr_model, len(scan_pages))
     st.warning(f"📷 스캔된 쪽이 {len(scan_pages)}개 있습니다. 글자가 사진으로 되어 있어 먼저 **글자 읽기(OCR)**를 해야 "
                f"번역할 수 있습니다. OpenAI({ocr_model})가 쪽 이미지를 읽으며"
-               + (f" 예상 비용은 약 {krw:,}원입니다." if krw is not None else ".")
+               + (f" 예상 비용은 약 {engines.fmt_usd(krw)}입니다." if krw is not None else ".")
                + " 읽은 결과는 저장되어 다시 비용이 들지 않습니다.")
     if not ocr_key:
         st.caption("OpenAI API Key가 필요합니다.")
@@ -500,11 +500,11 @@ todo = [pg for pg in sel if pg["mode"] == "text" and not has_translation(pg)]
 need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
 done_in_range = sum(1 for pg in sel if has_translation(pg))
 if engine_name == "OpenAI":
-    krw = engines.openai_cost_krw(model, need_chars)
+    krw = engines.openai_cost_usd(model, need_chars)
     n_figs = sum(len(core.figure_jobs(pg)) for pg in todo)
-    krw_f = (engines.figure_cost_krw(model, n_figs) if translate_captions else 0) or 0
-    krw_f += engines.scan_check_cost_krw(model, sum(1 for pg in todo if pg.get("ocr"))) or 0
-    cost = (f" · 예상 비용 약 {krw + krw_f:,}원" + (" (그림 글자 읽기·스캔 쪽 이미지 확인 포함)" if krw_f else "")
+    krw_f = (engines.figure_cost_usd(model, n_figs) if translate_captions else 0) or 0
+    krw_f += engines.scan_check_cost_usd(model, sum(1 for pg in todo if pg.get("ocr"))) or 0
+    cost = (f" · 예상 비용 약 {engines.fmt_usd(krw + krw_f)}" + (" (그림 글자 읽기·스캔 쪽 이미지 확인 포함)" if krw_f else "")
             if krw is not None else "")
 else:
     cost = " (DeepL 남은 한도는 번역 시작 시 확인해 보여 줍니다)"
@@ -737,14 +737,14 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
     if old_pages:
         olds = [pages[k - 1] for k in old_pages if pages[k - 1]["mode"] == "text"]
         oc = sum(len(core.plain(h)) for pg in olds for *_, h in units_of(pg))
-        ok = engines.openai_cost_krw(model, oc) if engine_name == "OpenAI" else None
+        ok = engines.openai_cost_usd(model, oc) if engine_name == "OpenAI" else None
         if ok is not None:
-            ok += (engines.figure_cost_krw(model, sum(len(core.figure_jobs(pg)) for pg in olds)) or 0) \
-                + (engines.scan_check_cost_krw(model, sum(1 for pg in olds if pg.get("ocr"))) or 0)
+            ok += (engines.figure_cost_usd(model, sum(len(core.figure_jobs(pg)) for pg in olds)) or 0) \
+                + (engines.scan_check_cost_usd(model, sum(1 for pg in olds if pg.get("ocr"))) or 0)
         st.warning(f"이전 번역본 중 **{len(old_pages)}쪽**은 개선 전 방식(쪽 경계 문장 이동, 표·그림 처리 이전)으로 "
                    "만든 쪽입니다. 이 쪽들은 이번 개선이 반영되지 않았으니 다시 번역하는 것을 권합니다.")
         if st.button(f"개선 전 방식 쪽 모두 다시 번역 ({len(olds)}쪽" +
-                     (f", 약 {ok:,}원)" if ok is not None else ")"), type="primary"):
+                     (f", 약 {engines.fmt_usd(ok)})" if ok is not None else ")"), type="primary"):
             run_translation(olds)
     if base_map:
         src_name = st.session_state.get("base_src") or "올린 파일"
@@ -770,12 +770,12 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
     redo = [pg for pg in redo if pg["mode"] == "text"]
     if redo:
         rc = sum(len(core.plain(h)) for pg in redo for *_, h in units_of(pg))
-        krw2 = engines.openai_cost_krw(model, rc) if engine_name == "OpenAI" else None
+        krw2 = engines.openai_cost_usd(model, rc) if engine_name == "OpenAI" else None
         if krw2 is not None and translate_captions:
-            krw2 += engines.figure_cost_krw(model, sum(len(core.figure_jobs(pg)) for pg in redo)) or 0
+            krw2 += engines.figure_cost_usd(model, sum(len(core.figure_jobs(pg)) for pg in redo)) or 0
         if krw2 is not None:
-            krw2 += engines.scan_check_cost_krw(model, sum(1 for pg in redo if pg.get("ocr"))) or 0
-        st.caption(f"{len(redo)}쪽 · 원문 약 {rc:,}자" + (f" · 예상 비용 약 {krw2:,}원" if krw2 is not None else ""))
+            krw2 += engines.scan_check_cost_usd(model, sum(1 for pg in redo if pg.get("ocr"))) or 0
+        st.caption(f"{len(redo)}쪽 · 원문 약 {rc:,}자" + (f" · 예상 비용 약 {engines.fmt_usd(krw2)}" if krw2 is not None else ""))
     if st.button("이 쪽만 다시 번역", disabled=not redo):
         run_translation(redo)
 

@@ -30,7 +30,15 @@ OPENAI_MODELS: dict[str, tuple[str, float, float]] = {
     "gpt-6.1-sol": ("고품질", 2.00, 10.00),
 }
 DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"   # 앱을 열었을 때 기본으로 선택되는 모델
-USD_KRW = 1400            # 비용 안내용 대략 환율
+def fmt_usd(usd: float | None) -> str:
+    """비용 표시 (달러). 환율은 바뀌므로 원화로 바꾸지 않는다."""
+    if usd is None:
+        return ""
+    if usd <= 0:
+        return "$0"
+    if usd < 0.01:
+        return "$0.01 미만"
+    return f"${usd:,.2f}"
 
 
 class EngineError(Exception):
@@ -534,15 +542,15 @@ def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[st
     return Engine(f"OpenAI ({model})", check, translate, workers=4)
 
 
-def openai_cost_krw(model: str, src_chars: int) -> int | None:
-    """영어 원문 글자 수로 OpenAI 비용(원)을 대략 추정. 지시문 반복 비용 포함 거친 값."""
+def openai_cost_usd(model: str, src_chars: int) -> float | None:
+    """영어 원문 글자 수로 OpenAI 비용(달러)을 대략 추정. 지시문 반복 비용 포함 거친 값."""
     if model not in OPENAI_MODELS:
         return None
     _, pin, pout = OPENAI_MODELS[model]
     tokens_in = src_chars / 4 * 1.3          # 원문 + 페이지마다 반복되는 지시문
     tokens_out = src_chars * 0.4             # 한국어 번역문 (대략)
     usd = tokens_in / 1e6 * pin + tokens_out / 1e6 * pout
-    return round(usd * USD_KRW)
+    return usd
 
 
 def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
@@ -741,13 +749,13 @@ def ocr_page(api_key: str, model: str, png: bytes) -> list[dict]:
         raise EngineError(f"글자 읽기 결과 형식 오류: {e}")
 
 
-def ocr_cost_krw(model: str, n_pages: int) -> int | None:
+def ocr_cost_usd(model: str, n_pages: int) -> float | None:
     """쪽당 이미지 입력 약 2,000토큰 + 출력 약 1,500토큰으로 거칠게 추정."""
     if model not in OPENAI_MODELS:
         return None
     _, pin, pout = OPENAI_MODELS[model]
     usd = n_pages * (2_500 / 1e6 * pin + 1_500 / 1e6 * pout)
-    return round(usd * USD_KRW)
+    return usd
 
 
 # ─────────────────────────── 그림 속 문구 (OpenAI 이미지 읽기) ───────────────────────────
@@ -815,12 +823,12 @@ def figure_labels(api_key: str, model: str, png: bytes, target: str = "KO",
         raise EngineError(f"그림 글자 읽기 결과 형식 오류: {e}")
 
 
-def figure_cost_krw(model: str, n_figs: int) -> int | None:
+def figure_cost_usd(model: str, n_figs: int) -> float | None:
     """그림 1개당 이미지 입력 약 1,500토큰 + 출력 약 600토큰으로 거칠게 추정."""
     if model not in OPENAI_MODELS:
         return None
     _, pin, pout = OPENAI_MODELS[model]
-    return round(n_figs * (1_500 / 1e6 * pin + 600 / 1e6 * pout) * USD_KRW)
+    return n_figs * (1_500 / 1e6 * pin + 600 / 1e6 * pout)
 
 
 # ─────────────────────────── 스캔 쪽 이미지 확인 (기울임·OCR 오류) ───────────────────────────
@@ -887,9 +895,9 @@ def scan_check(api_key: str, model: str, png: bytes, segs: list[dict]) -> dict:
         raise EngineError(f"스캔 쪽 확인 결과 형식 오류: {e}")
 
 
-def scan_check_cost_krw(model: str, n_pages: int) -> int | None:
+def scan_check_cost_usd(model: str, n_pages: int) -> float | None:
     """쪽당 이미지 약 1,600토큰 + 조각 글 약 1,000토큰 입력, 출력 약 400토큰으로 거칠게 추정."""
     if model not in OPENAI_MODELS:
         return None
     _, pin, pout = OPENAI_MODELS[model]
-    return round(n_pages * (2_600 / 1e6 * pin + 400 / 1e6 * pout) * USD_KRW)
+    return n_pages * (2_600 / 1e6 * pin + 400 / 1e6 * pout)
