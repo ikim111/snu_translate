@@ -454,15 +454,17 @@ def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[st
                 if "reasoning" not in str(e):
                     raise
                 resp = client.responses.create(**kw)   # reasoning 옵션이 없는 모델
-            out = json.loads(resp.output_text)["items"]
+            raw_text = resp.output_text
         except openai.OpenAIError as e:
             raise wrap(e)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            raise EngineError(f"번역 결과 형식 오류: {e}")
-        by_id = {o.get("id"): o for o in out if isinstance(o, dict)}
-        if len(out) != len(segs) or any(sg["id"] not in by_id for sg in segs):
-            raise EngineError(f"번역 결과가 입력 조각과 맞지 않습니다 ({len(segs)}개 → {len(out)}개).")
-        return [by_id[sg["id"]] for sg in segs]
+        out = _parse_items(raw_text, segs)
+        if out is None and not extra.endswith("[형식 재요청]"):
+            # 모델이 형식을 어기면 한 번만 다시 요청한다
+            return call(segs, extra + "\n\n출력은 반드시 {\"items\": [{\"id\", \"translation\", \"status\", "
+                                      "\"review\"}]} 형식의 JSON 하나여야 한다. [형식 재요청]")
+        if out is None:
+            raise EngineError(f"번역 결과 형식 오류 — 받은 내용 앞부분: {raw_text[:160]!r}")
+        return out
 
     def suspicious(src: str, tr: str) -> bool:
         """누락(너무 짧음)이나 태그 유실, 원문에 없는 생략 부호가 의심되는지."""
@@ -541,6 +543,56 @@ def openai_cost_krw(model: str, src_chars: int) -> int | None:
     tokens_out = src_chars * 0.4             # 한국어 번역문 (대략)
     usd = tokens_in / 1e6 * pin + tokens_out / 1e6 * pout
     return round(usd * USD_KRW)
+
+
+def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
+    """번역 응답 → 입력 조각 순서의 [{id, translation, status, review}].
+    정해진 형식({"items": [...]})을 어긴 응답도 알아볼 수 있으면 받아 준다
+    (다른 키 이름, 목록만 반환, translation 대신 text 등). 짝이 안 맞으면 None."""
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        m = re.search(r"\{.*\}|\[.*\]", text or "", re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    lst = None
+    if isinstance(obj, list):
+        lst = obj
+    elif isinstance(obj, dict):
+        if isinstance(obj.get("items"), list):
+            lst = obj["items"]
+        else:
+            lst = next((v for v in obj.values() if isinstance(v, list)), None)
+    if not isinstance(lst, list) or len(lst) != len(segs):
+        return None
+    out: list[dict] = []
+    for sg, o in zip(segs, lst):
+        if isinstance(o, str):
+            o = {"id": sg["id"], "translation": o}
+        if not isinstance(o, dict):
+            return None
+        tr = o.get("translation", o.get("text", o.get("ko", o.get("translated"))))
+        if not isinstance(tr, str):
+            return None
+        if o.get("id") not in (None, sg["id"]):
+            by_id = {x.get("id"): x for x in lst if isinstance(x, dict)}
+            if sg["id"] not in by_id:
+                return None
+            o = by_id[sg["id"]]
+            tr = o.get("translation", o.get("text", tr))
+        out.append({"id": sg["id"], "translation": tr,
+                    "status": o.get("status") if o.get("status") in ("ok", "needs_review") else "ok",
+                    "review": o.get("review") or ""})
+    # 입력을 그대로 되돌려 준 응답(번역 안 됨)은 받지 않는다
+    same = sum(1 for sg, o in zip(segs, out) if o["translation"].strip() == sg["text"].strip() and
+               re.search(r"[A-Za-z]{4,}", sg["text"]))
+    if same > max(1, len(segs) // 2):
+        return None
+    return out
 
 
 # ─────────────────────────── 용어 추천 (OpenAI) ───────────────────────────

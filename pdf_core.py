@@ -1850,9 +1850,15 @@ def _extract_one(doc: pymupdf.Document, i: int) -> dict:
     return pg
 
 
-def _extract_chunk(pdf_bytes: bytes, idxs: list[int]) -> list[dict]:
-    """다른 프로세스에서 몇 쪽을 읽는다 (동시 처리용)."""
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+def _load_chunk(data: bytes) -> list[dict]:
+    import gzip
+    import json
+
+    return _dec(json.loads(gzip.decompress(data).decode("utf-8"))["pages"])
+
+
+def _extract_chunk_doc(doc: pymupdf.Document, idxs: list[int]) -> list[dict]:
+    """하위 프로세스에서 몇 쪽을 읽는다 (동시 처리용)."""
     out = []
     for i in idxs:
         pg = _extract_one(doc, i)
@@ -1874,21 +1880,38 @@ def extract_document(doc: pymupdf.Document, progress=None, workers: int | None =
     workers = workers if workers is not None else min(4, os.cpu_count() or 1)
     pages: list[dict | None] = [None] * n
     if workers > 1 and n >= 4 and _scan_heavy(doc):
+        # 별도 파이썬 프로세스 여러 개로 나눠 읽는다 (Streamlit 앱 스크립트를 다시 실행하지 않도록
+        # multiprocessing 대신 하위 프로세스를 직접 띄운다)
         import concurrent.futures as cf
-        import multiprocessing as mp
+        import subprocess
+        import sys
+        import tempfile
 
-        data = doc.tobytes()
-        chunks = [list(range(k, n, workers * 2)) for k in range(workers * 2)]   # 쪽을 고르게 나눈다
+        chunks = [list(range(k, n, workers)) for k in range(workers)]
         done = 0
         try:
-            with cf.ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
-                futs = [pool.submit(_extract_chunk, data, ch) for ch in chunks if ch]
-                for f in cf.as_completed(futs):
-                    for pg in f.result():
-                        pages[pg["page_number"] - 1] = pg
-                        done += 1
-                    if progress:
-                        progress(done, n)
+            with tempfile.TemporaryDirectory() as td:
+                src = os.path.join(td, "src.pdf")
+                doc.save(src)
+
+                def run(k: int, idxs: list[int]) -> list[dict]:
+                    out = os.path.join(td, f"out{k}.json.gz")
+                    code = ("import sys, pymupdf, pdf_core as c; d = pymupdf.open(sys.argv[1]); "
+                            "idx = [int(x) for x in sys.argv[3].split(',')]; "
+                            "open(sys.argv[2], 'wb').write(c.dump_pages(c._extract_chunk_doc(d, idx)))")
+                    subprocess.run([sys.executable, "-c", code, src, out, ",".join(map(str, idxs))],
+                                   cwd=str(Path(__file__).parent), check=True, timeout=1800,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    return _load_chunk(Path(out).read_bytes())
+
+                with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = [pool.submit(run, k, ch) for k, ch in enumerate(chunks) if ch]
+                    for f in cf.as_completed(futs):
+                        for pg in f.result():
+                            pages[pg["page_number"] - 1] = pg
+                            done += 1
+                        if progress:
+                            progress(done, n)
         except Exception:
             pages = [None] * n                    # 동시 처리가 안 되는 환경이면 한 쪽씩
         for i, pg in enumerate(pages):           # 돌린 쪽(가로 표)은 원본을 이 프로세스에 다시 만든다

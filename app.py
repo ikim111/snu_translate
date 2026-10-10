@@ -610,7 +610,8 @@ def figure_pngs(pg: dict) -> dict[str, bytes]:
 
 
 def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
-                   pngs: dict[str, bytes]) -> tuple[list[str], list[dict], dict]:
+                   pngs: dict[str, bytes], scan_store: dict | None = None,
+                   sig: str = "") -> tuple[list[str], list[dict], dict]:
     """한 쪽 번역. 쪽 경계에서 이어지는 문장은 앞뒤 쪽 원문을 '참고 맥락'으로 함께 보낸다(옮기지는 않음).
     그림 속 문구는 OpenAI면 그림 이미지를 직접 읽어 번역하고, DeepL이면 무료 OCR로 읽은 문구를 번역한다.
     반환: (번역 목록, 검토가 필요한 조각 [{id, review}], 그림 번역 {그림 위치: {src, tr, review}})"""
@@ -622,8 +623,15 @@ def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
         htmls = [h for *_, h in units]
         # 스캔 쪽: 쪽 이미지와 OCR 글을 대조해 기울임(→ 굵게+밑줄)과 OCR 오류를 번역 전에 반영
         if engine_name == "OpenAI" and pg.get("ocr") and "page" in pngs:
-            chk = engines.scan_check(api_key, model, pngs["page"],
-                                     [{"id": m["id"], "text": core.plain(h)} for m, h in zip(meta, htmls)])
+            # 이미지 확인 결과는 저장해 두어, 번역이 실패해 다시 누를 때 또 돈을 쓰지 않게 한다
+            memo = (scan_store or {}).get(str(pg["page_number"]))
+            if memo and memo.get("sig") == sig:
+                chk = memo["chk"]
+            else:
+                chk = engines.scan_check(api_key, model, pngs["page"],
+                                         [{"id": m["id"], "text": core.plain(h)} for m, h in zip(meta, htmls)])
+                if scan_store is not None:
+                    scan_store[str(pg["page_number"])] = {"sig": sig, "chk": chk}
             by_id: dict[str, dict] = {}
             for it in chk.get("italics", []):
                 by_id.setdefault(it["id"], {"i": [], "f": []})["i"].append(it["phrase"])
@@ -681,7 +689,9 @@ def run_translation(targets: list[dict]) -> None:
     done = 0
     with ThreadPoolExecutor(max_workers=engine.workers) as pool:
         pngs = {pg["page_number"]: figure_pngs(pg) for pg in targets}
-        futures = {pool.submit(translate_page, engine, pg, pages, pngs[pg["page_number"]]): pg for pg in targets}
+        scan_store = cache.setdefault("_scan", {})
+        futures = {pool.submit(translate_page, engine, pg, pages, pngs[pg["page_number"]], scan_store,
+                               units_sig(pg)): pg for pg in targets}
         status.write(f"번역 중… 0 / {len(targets)}쪽")
         for fut in as_completed(futures):
             pg = futures[fut]
@@ -704,6 +714,7 @@ def run_translation(targets: list[dict]) -> None:
             bar.progress(done / len(targets))
             status.write(f"번역 중… {done} / {len(targets)}쪽 (방금 끝난 페이지: {pno})")
 
+    save_cache(cache_key, cache)                 # 실패한 쪽의 이미지 확인 결과도 남겨 둔다
     status.write(f"번역 끝: {len(targets) - len(failures)} / {len(targets)}쪽")
     if fatal:
         st.error(f"{fatal} — 번역을 멈췄습니다. 지금까지 번역한 페이지는 저장되어 있습니다.")
@@ -831,7 +842,7 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
 translated_count = sum(1 for pg in sel if has_translation(pg))
 if translated_count:
     build_sig = (cache_key, start, end, interleave, len(cache),
-                 hashlib.md5(json.dumps({k: v.get("tr") for k, v in cache.items()}, ensure_ascii=False)
+                 hashlib.md5(json.dumps({k: v.get("tr") for k, v in cache.items() if k.isdigit()}, ensure_ascii=False)
                              .encode()).hexdigest(),
                  len(st.session_state.get("base_pdf") or b""))
     if st.session_state.get("built", (None,))[0] != build_sig:
