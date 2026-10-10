@@ -477,7 +477,7 @@ def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[st
             model=model,
             instructions=instructions + extra,
             input=json.dumps({"segments": segs}, ensure_ascii=False),
-            text={"format": {"type": "json_schema", "name": "translations", "schema": schema, "strict": True}},
+            text={"format": {"type": "json_schema", "name": "translation_items", "schema": schema, "strict": True}},
         )
         try:
             try:
@@ -577,6 +577,20 @@ def openai_cost_usd(model: str, src_chars: int) -> float | None:
     return usd
 
 
+def unwrap_translation(t: str) -> str:
+    """이전 버그로 번역문 자리에 JSON('{"id": …, "translation": …}')이 통째로 저장된 경우 번역문만 꺼낸다."""
+    if isinstance(t, str):
+        st_ = t.strip()
+        if st_.startswith("{") and '"translation"' in st_:
+            try:
+                o = json.loads(st_)
+                if isinstance(o, dict) and isinstance(o.get("translation"), str):
+                    return o["translation"]
+            except json.JSONDecodeError:
+                pass
+    return t
+
+
 def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
     """번역 응답 → 입력 조각 순서의 [{id, translation, status, review}].
     정해진 형식({"items": [...]})을 어긴 응답도 알아볼 수 있으면 받아 준다
@@ -604,7 +618,14 @@ def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
     out: list[dict] = []
     for sg, o in zip(segs, lst):
         if isinstance(o, str):
-            o = {"id": sg["id"], "translation": o}
+            st_ = o.strip()
+            if st_.startswith("{") and st_.endswith("}"):
+                try:                                   # 항목을 JSON 문자열로 감싸 보낸 경우
+                    o = json.loads(st_)
+                except json.JSONDecodeError:
+                    o = {"id": sg["id"], "translation": o}
+            else:
+                o = {"id": sg["id"], "translation": o}
         if not isinstance(o, dict):
             return None
         tr = o.get("translation", o.get("text", o.get("ko", o.get("translated"))))

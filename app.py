@@ -598,8 +598,8 @@ def make_engine() -> engines.Engine:
 
 def figure_pngs(pg: dict) -> dict[str, bytes]:
     """그림 영역 이미지 (메인 스레드에서 미리 만든다 — PyMuPDF 문서는 여러 스레드에서 함께 쓰면 안 됨)."""
-    if pg.get("rotated") and pg.get("_rot_key") in core._ROT_DOCS:
-        page = core._ROT_DOCS[pg["_rot_key"]][0]
+    if pg.get("rotated"):
+        page = core.rotated_source(src, pg)[0]
     else:
         page = src[pg["page_number"] - 1]
     out = {core.fig_key(b): page.get_pixmap(clip=b["bbox"], dpi=engines.FIG_DPI).tobytes("png")
@@ -787,7 +787,7 @@ def translated_page(pg: dict) -> dict | None:
     if pg["mode"] != "text" or not cached_ok(pg):
         return None
     tpg = copy.deepcopy(pg)
-    core.apply_translations(tpg, units_of(tpg), entry["tr"])
+    core.apply_translations(tpg, units_of(tpg), [engines.unwrap_translation(t) for t in entry["tr"]])
     core.apply_figure_translations(tpg, entry.get("figs") or {})
     return tpg
 

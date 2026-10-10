@@ -906,21 +906,41 @@ def _word_quality(raw: dict) -> float:
     return good / len(words)
 
 
+def _rotated_image_doc(page: pymupdf.Page, rot: int) -> pymupdf.Document:
+    """쪽을 rot도 돌린 이미지 한 장짜리 문서 (아래쪽 다운로드 안내 띠는 빼고)."""
+    W, H = page.rect.width, page.rect.height
+    tmp = pymupdf.open()
+    tp = tmp.new_page(width=H, height=W)
+    tp.show_pdf_page(tp.rect, page.parent, page.number, rotate=rot, clip=pymupdf.Rect(0, 0, W, H - FOOTER_BAND))
+    pix = tp.get_pixmap(dpi=300)
+    img = pymupdf.open()
+    ip = img.new_page(width=H, height=W)
+    ip.insert_image(ip.rect, pixmap=pix)
+    return img
+
+
+def rotated_source(src_doc: pymupdf.Document, pg: dict) -> pymupdf.Document | None:
+    """돌린 표 쪽의 돌린 원본. 메모리에서 사라졌으면(앱 갱신 등) 다시 만든다."""
+    if not pg.get("rotated"):
+        return None
+    key = pg.get("_rot_key")
+    if key not in _ROT_DOCS:
+        key = f"rot_{id(src_doc)}_{pg['page_number']}_{pg['rotated']}"
+        if key not in _ROT_DOCS:
+            _ROT_DOCS[key] = _rotated_image_doc(src_doc[pg["page_number"] - 1], pg["rotated"])
+        pg["_rot_key"] = key
+    return _ROT_DOCS[key]
+
+
 def _extract_rotated_scan(page: pymupdf.Page) -> dict[str, Any] | None:
     """스캔 쪽을 90°/270° 돌린 이미지로 다시 읽어, 더 그럴듯한 방향을 고른다.
     결과는 돌린 좌표계의 블록이며, 조판할 때 가로 쪽에 짠 뒤 다시 돌려 붙인다(render_page)."""
     W, H = page.rect.width, page.rect.height
     best = None
     for rot in (90, 270):
-        tmp = pymupdf.open()
-        tp = tmp.new_page(width=H, height=W)
         # 아래쪽 다운로드 안내 띠는 돌리면 세로 글자 쓰레기가 되므로 빼고 돌린다
-        tp.show_pdf_page(tp.rect, page.parent, page.number, rotate=rot,
-                         clip=pymupdf.Rect(0, 0, W, H - FOOTER_BAND))
-        pix = tp.get_pixmap(dpi=300)
-        img = pymupdf.open()
-        ip = img.new_page(width=H, height=W)
-        ip.insert_image(ip.rect, pixmap=pix)
+        img = _rotated_image_doc(page, rot)
+        ip = img[0]
         try:
             raw = _reocr_raw(ip, ip.get_text("rawdict"))
         except Exception:
@@ -2223,8 +2243,11 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
     printed = pg["printed"] if "printed" in pg else printed_page_number(pg["blocks"])
     label = f"PDF p.{pno}" + (f" · 인쇄 {printed}쪽" if printed else "")
 
-    if pg.get("rotated") and pg.get("_rot_key") not in _ROT_DOCS and not note:
-        note = "가로 표 — 원문 분석 정보가 없어 원문 그대로 (PDF를 다시 올려 주세요)"
+    if pg.get("rotated") and not note:
+        try:
+            rotated_source(src_doc, pg)
+        except Exception:
+            note = "가로 표 — 돌린 원본을 만들지 못해 원문 그대로"
     # 가로로 돌려 인쇄한 스캔 표: 돌린 원문(가로 쪽)에 맞춰 짠 뒤, 원래 방향으로 돌려 붙인다
     if pg.get("rotated") and pg.get("_rot_key") in _ROT_DOCS and pg["mode"] == "text" and not note:
         inner = {k: v for k, v in pg.items() if k not in ("rotated", "_rot_key")}
@@ -2539,12 +2562,15 @@ def apply_ocr(doc: pymupdf.Document, pages: list[dict], ocr: dict[str, list[dict
 def annotate_first_terms(pages: list[dict], glossary: dict[str, str]) -> None:
     """용어집 용어가 논문에서 처음 나오는 번역문 한 곳에 '번역어(English)'로 영어를 병기한다(제자리 수정).
     번역은 페이지별로 따로 하므로 '첫 등장'은 이렇게 다 모은 뒤 처리한다. 참고문헌·표는 건너뛴다."""
-    pending = {en: ko for en, ko in glossary.items() if en and ko}
+    # 일반 단어(average, data, mean …)까지 영어를 붙이면 문장이 어지러워진다 → 여러 단어 용어나 긴 전문어만
+    pending = {en: ko for en, ko in glossary.items() if en and ko and (" " in en.strip() or len(en.strip()) >= 8)}
     if not pending:
         return
     for pg in pages:
         for b in pg["blocks"]:
-            if b["kind"] in ("reference", "header", "meta", "figure", "table") or "tr" not in b:
+            # 제목·소제목·캡션·저자 줄·표·그림에는 넣지 않는다 (구조를 깨지 않게)
+            if b["kind"] in ("reference", "header", "meta", "figure", "table", "heading", "caption") \
+                    or "tr" not in b or b.get("byline") or b.get("title"):
                 continue
             src = b["text"].lower()
             for en, ko in list(pending.items()):
@@ -2777,10 +2803,4 @@ def load_pages(data: bytes, doc: pymupdf.Document) -> list[dict] | None:
         return None
     if obj.get("version") != EXTRACT_VERSION or len(obj.get("pages", [])) != doc.page_count:
         return None
-    pages = _dec(obj["pages"])
-    for i, pg in enumerate(pages):
-        if pg.get("rotated"):
-            fresh = _extract_one(doc, i)
-            fresh["printed"] = pg.get("printed")
-            pages[i] = fresh
-    return pages
+    return _dec(obj["pages"])                  # 돌린 표 쪽의 돌린 원본은 조판할 때 다시 만든다(rotated_source)
