@@ -17,6 +17,7 @@ text_table.py — 괘선이 없거나 적은 '글자로만 된 표'를 찾아 �
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import pymupdf
@@ -68,6 +69,19 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         if len(cands) < 3:
             i = j + 1
             continue
+        # 머리행은 칸 사이가 좁아 후보 행이 아닐 수 있다 → 바로 위의 짧은 줄들(최대 4행)도 머리행 후보로 붙인다
+        k = i
+        x_first = min(c["bbox"].x0 for r in cands for c in r)
+        while k - 1 >= 0 and len(run) - (j - i + 1) < 4 and id(rows[k - 1]) not in used:
+            gap = rows[k][0]["_yc"] - rows[k - 1][0]["_yc"]
+            if gap > max(c["size"] for c in rows[k - 1]) * 2.6:
+                break
+            # 표 제목·본문 줄(왼쪽 끝에서 시작하는 한 줄)은 머리행이 아니다
+            if len(rows[k - 1]) == 1 and rows[k - 1][0]["bbox"].x0 < x_first + 15 \
+                    and len(rows[k - 1][0]["text"].strip()) > 12:
+                break
+            k -= 1
+            run.insert(0, rows[k])
         # 열: 여러 행의 칸이 가로로 겹치는 범위끼리 묶는다 (가운데 정렬된 숫자 칸도 한 열로)
         spans_x = sorted((c["bbox"].x0, c["bbox"].x1) for r in cands for c in r)
         groups: list[list[float]] = []          # [x0, x1, count]
@@ -78,6 +92,12 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             else:
                 groups.append([x0, x1, 1])
         groups = [g for g in groups if g[2] >= max(2, len(cands) * 0.25)]
+        # 표 옆에 나란히 놓인 표 제목 줄들(긴 글, 숫자 없음)로만 이뤄진 열은 버린다 (Springer 'Table 1 …' 옆 배치)
+        def caption_like(g: list[float]) -> bool:
+            cells = [c for r in cands for c in r if c["bbox"].x0 >= g[0] - 0.5 and c["bbox"].x1 <= g[1] + 0.5]
+            return bool(cells) and all(len(c["text"].strip()) > 25 and not any(ch.isdigit() for ch in c["text"])
+                                       for c in cells)
+        groups = [g for g in groups if not caption_like(g)]
         if len(groups) < 2:
             i = j + 1
             continue
@@ -130,6 +150,12 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             r = ranged[top - 1]
             gap = ranged[top][0]["_yc"] - r[0]["_yc"]
             only_col0 = all(col_of(c) == 0 for c in r) and len(r) == 1
+            if only_col0 and top - 2 >= 0:
+                # 첫 열 머리글('Occupation') 바로 위에 다른 열 머리글 줄이 붙어 있으면 머리행의 일부
+                r2 = ranged[top - 2]
+                if len(r2) >= 1 and any(col_of(c) not in (0, None) for c in r2) and \
+                        r[0]["_yc"] - r2[0]["_yc"] <= r[0]["size"] * 2.0 and gap <= r[0]["size"] * 2.0:
+                    only_col0 = False
             if gap > r[0]["size"] * 2.6 or only_col0:
                 break
             top -= 1
@@ -141,6 +167,22 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         if sum(1 for r in table_rows if len(r) >= 2) < 3:
             i = j + 1
             continue
+        # 긴 칸(설명 글)은 '짧은 줄' 조건에서 빠졌을 수 있다 → 표 행과 같은 높이의 긴 줄을 그 행에 넣는다
+        short_ids = {l["id"] for l in short}
+        x_left = col_x[0] - 10
+        x_right = max(c["bbox"].x1 for r in cands for c in r) + 20
+        y_top = table_rows[0][0]["_yc"] - 3
+        y_bot = table_rows[-1][0]["_yc"] + 3
+        for l in lines:
+            if l["id"] in short_ids or l["bbox"].x0 < x_left or l["bbox"].x0 > x_right:
+                continue
+            yc = (l["bbox"].y0 + l["bbox"].y1) / 2
+            if not (y_top <= yc <= y_bot):
+                continue
+            r = min(table_rows, key=lambda r: abs(r[0]["_yc"] - yc))
+            if abs(r[0]["_yc"] - yc) <= 3 and r[-1]["bbox"].x1 <= l["bbox"].x0 + 2:
+                r.append({**l, "_yc": r[0]["_yc"]})
+                r.sort(key=lambda c: c["bbox"].x0)
         for r in run:
             used.add(id(r))
 
@@ -152,6 +194,17 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             return min(range(len(groups)), key=lambda k: abs((groups[k][0] + groups[k][1]) / 2 - cx))
 
         # 머리행 위에 여러 열을 덮는 한 줄('Implementation')이 있으면 묶음 머리글
+        # 데이터 바로 위 머리행 줄이 열을 더 잘게 나누면(빈칸이 많은 표) 그 칸들을 열 기준으로 쓴다
+        if first - 1 >= top:
+            hdr = sorted(ranged[first - 1], key=lambda c: c["bbox"].x0)
+            if len(hdr) > len(groups) and all(hdr[k + 1]["bbox"].x0 > hdr[k]["bbox"].x1 for k in range(len(hdr) - 1)):
+                left = [g for g in groups if g[1] < hdr[0]["bbox"].x0]
+                new = [list(g) for g in left] + [[c["bbox"].x0, c["bbox"].x1, 1] for c in hdr]
+                for k in range(len(new) - 1):            # 이웃 열과의 가운데까지 넓힌다
+                    mid = (new[k][1] + new[k + 1][0]) / 2
+                    new[k][1], new[k + 1][0] = max(new[k][1], mid - 0.01), min(new[k + 1][0], mid + 0.01)
+                groups[:] = new
+                col_x[:] = [g[0] for g in groups]
         # 머리행 위에 여러 열을 덮는 줄('Implementation', '1990-1991' / 'Site 1')이 있으면 묶음 머리글
         super_rows: list[dict] = []
         k0 = next((k for k, r in enumerate(rows) if any(c.get("id") == ranged[top][0].get("id") for c in r)), None)
@@ -245,6 +298,37 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
                 group_row.append((None, ncol - col))
             grid = grid[1:]
             header_n = 0
+    # 여러 줄 머리행의 맨 윗줄이 칸 하나뿐이면('Residuals by ethnicity') 여러 열을 덮는 묶음 머리글
+    extra_sup: list[int] = []
+    # 첫 데이터 행이 모두 기울임·굵게('Code' | 'Subprocess')이고 다음 행은 아니면 그 행이 열 머리글
+    def styled(r: list[list[int]]) -> bool:
+        cells = [items[i] for cell in r for i in cell]
+        return bool(cells) and all(re.fullmatch(r"\s*<(i|b)>.*</\1>\s*", h) for h in cells)
+    title_idx: list[int] = []
+    if len(grid) > header_n + 1 and styled(grid[header_n]) and not styled(grid[header_n + 1]) \
+            and sum(1 for cell in grid[header_n] if cell) >= 2:
+        # 그 위의 칸 하나짜리 줄들은 표 제목 ('APPENDIX B', 'Code and Subprocess Reference')
+        while header_n >= 1 and sum(1 for cell in grid[0] if cell) == 1:
+            title_idx += [i for cell in grid[0] for i in cell]
+            grid = grid[1:]
+            rows = rows[1:]
+            header_n -= 1
+        header_n += 1
+
+    def continues_below(k: int) -> bool:
+        """머리행 k번째 줄의 칸이 바로 아랫줄 같은 열 칸으로 이어지는지('Native' → 'American')."""
+        if k + 1 >= header_n:
+            return False
+        c = next(c for c in rows[k])
+        below = [d for d in rows[k + 1] if col_of(d) == col_of(c)]
+        return bool(below) and below[0]["bbox"].y0 - c["bbox"].y1 <= c["size"] * 0.6
+    while header_n >= 2 and sum(1 for cell in grid[0] if cell) == 1 and \
+            max(sum(1 for cell in g if cell) for g in grid[1:header_n]) >= 3 and not grid[0][0] \
+            and not continues_below(0):
+        extra_sup += [i for cell in grid[0] for i in cell]
+        grid = grid[1:]
+        rows = rows[1:]
+        header_n -= 1
     header: list[int | None] = [None] * ncol
     if header_n == 0 and group_row is None and len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
         header_n = 1
@@ -258,9 +342,13 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
         grid = grid[header_n:]
 
     sup = None
-    if super_rows:
-        items.append(" · ".join(c["html"].strip() for c in super_rows))
-        texts.append(" · ".join(c["text"].strip() for c in super_rows))
+    if extra_sup:
+        super_rows = list(super_rows or [])
+    if super_rows or extra_sup:
+        if not super_rows:
+            super_rows = []
+        items.append(" · ".join([c["html"].strip() for c in super_rows] + [items[i] for i in extra_sup]))
+        texts.append(" · ".join([c["text"].strip() for c in super_rows] + [texts[i] for i in extra_sup]))
         ids.extend(c["id"] for c in super_rows)
         sup = len(items) - 1
     # 행 머리글의 둘째 줄('(n = 26)')만 있는 행은 앞 행 머리글에 붙인다
@@ -292,7 +380,7 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
     x1 = max(c["bbox"].x1 for c in all_cells)
     bbox = pymupdf.Rect(x0, min(c["bbox"].y0 for c in all_cells), x1, max(c["bbox"].y1 for c in all_cells))
     size = sorted(c["size"] for c in all_cells)[len(all_cells) // 2]
-    layout = {"title": None, "super": sup, "group_row": group_row, "header": header, "rows": grid, "note": None, "bulleted": [],
+    layout = {"title": title_idx or None, "super": sup, "group_row": group_row, "header": header, "rows": grid, "note": None, "bulleted": [],
               "col_x": [x - x0 for x in col_x] + [x1 - x0], "width": x1 - x0}
     return {"kind": "table", "bbox": bbox, "size": size, "items": items, "layout": layout,
             "html": "", "text": "\n".join(texts), "line_ids": ids}

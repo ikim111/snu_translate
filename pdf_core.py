@@ -533,7 +533,7 @@ def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
     ('buildin', '80/6' ← building, 8%). 쪽 이미지를 tesseract로 다시 읽어 글자층을 바꾼다.
     tesseract가 없으면 None (원래 글자층 사용)."""
     td = _tessdata()
-    if not td:
+    if not td or os.environ.get("SNU_NO_REOCR"):
         return None
     # 세로로 인쇄된 여백 글(저작권 안내 등)은 OCR하면 기호 쓰레기가 된다 → 원래 글자층에서 위치를 찾아 지우고 읽는다
     rot_rects = [pymupdf.Rect(l["bbox"]) for b in old_raw.get("blocks", []) for l in b.get("lines", [])
@@ -620,7 +620,19 @@ def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
                         out.append(ch[i]); i += 1
                 sp["chars"] = out
     _split_ocr_columns(raw, page.rect)
-    _align_with_layer(raw, layer_words)
+    st_ = _align_with_layer(raw, layer_words)
+    raw["_align"] = {k: v for k, v in st_.items() if k != "dx"}
+    # 원래 글자층이 이미지와 정확히 겹치고(단어 양끝 위치 차이 합의 중앙값 < 4pt; JSTOR처럼 어긋난 글자층은 6pt 이상) 잘린 단어도 거의 없으면
+    # 글자층이 더 정확하다(숫자 부호·자릿수 등) → 글자층을 그대로 쓴다
+    if st_["dx"] and len(st_["dx"]) >= 50 and statistics.median(st_["dx"]) < 4 and \
+            sorted(st_["dx"])[int(len(st_["dx"]) * 0.9)] < 8 and st_["trunc"] <= max(2, st_["tokens"] * 0.005):
+        if os.environ.get("SNU_DEBUG_ALIGN"):
+            print("ALIGN", page.number + 1, "→ 글자층 사용")
+        return None
+    if os.environ.get("SNU_DEBUG_ALIGN"):
+        print("ALIGN", page.number + 1, {k: v for k, v in st_.items() if k != "dx"},
+              "dx_med", round(statistics.median(st_["dx"]), 2) if st_["dx"] else None,
+              "dx_p90", round(sorted(st_["dx"])[int(len(st_["dx"]) * 0.9)], 2) if st_["dx"] else None)
     _mark_bold_by_ink(page, raw)
     raw["_reocr"] = True
     return raw
@@ -721,6 +733,9 @@ def _pick_token(o: str, l: str, freq: dict[str, int]) -> str:
         return l                                   # 대소문자는 글자층이 더 정확 ('Strategies')
     if "%" in o and "%" not in l:
         return o
+    num = r"[-−–+]?\(?[\d.,]+\)?%?[.,;)]?"
+    if re.fullmatch(num, o) and re.fullmatch(num, l):
+        return l                                   # 숫자: tesseract는 음수 부호·자릿수를 놓친다('-24' → '24')
     if nl and no.startswith(nl):
         return o                                   # 글자층이 잘린 단어
     if re.search(r"[?>]", o) and not re.search(r"[?>]", l) and l[:1].isalnum():
@@ -734,10 +749,13 @@ def _pick_token(o: str, l: str, freq: dict[str, int]) -> str:
     return o
 
 
-def _align_with_layer(raw: dict, layer_words: list) -> None:
-    """줄마다 원래 글자층의 같은 높이 단어들과 맞대어, 한 단어씩 어긋난 곳을 고친다."""
+def _align_with_layer(raw: dict, layer_words: list) -> dict:
+    """줄마다 원래 글자층의 같은 높이 단어들과 맞대어, 한 단어씩 어긋난 곳을 고친다.
+    반환: 비교 통계 {tokens, equal, trunc} (글자층을 믿을 만한지 판단용)"""
     import difflib
     from collections import Counter
+
+    stats: dict = {"tokens": 0, "equal": 0, "trunc": 0, "dx": []}
 
     freq: Counter = Counter(_norm_tok(w[4]) for w in layer_words)
     for b in raw["blocks"]:
@@ -785,15 +803,25 @@ def _align_with_layer(raw: dict, layer_words: list) -> None:
             sm = difflib.SequenceMatcher(a=[_norm_tok(t) for t in ot], b=[_norm_tok(t) for t in lt],
                                          autojunk=False)
             for op, a0, a1, b0, b1 in sm.get_opcodes():
+                stats["tokens"] += a1 - a0
+                if op == "equal":
+                    stats["equal"] += a1 - a0
                 pairs = []
                 if op == "equal":
                     pairs = list(zip(range(a0, a1), range(b0, b1)))
+                    for ai, bi in pairs:
+                        stats["dx"].append(abs(spans[ai]["bbox"][0] - lw[bi][0]) + abs(spans[ai]["bbox"][2] - lw[bi][2]))
                 elif op == "replace" and a1 - a0 == b1 - b0:
                     pairs = list(zip(range(a0, a1), range(b0, b1)))
                 for ai, bi in pairs:
+                    no_, nl_ = _norm_tok(ot[ai]), _norm_tok(lt[bi])
+                    if nl_ and no_ != nl_ and no_.startswith(nl_):
+                        stats["trunc"] += 1          # 글자층 단어가 잘림 ('buildin')
                     new = _pick_token(ot[ai], lt[bi], freq)
                     if new != ot[ai]:
                         _set_span_text(spans[ai], new)
+
+    return stats
 
 
 def _set_span_text(sp: dict, text: str) -> None:
@@ -924,6 +952,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
     if _in_rotated:
         raw = _reocr_raw(page, raw) or raw
     elif _page_is_image_backed(page) and not is_scanned(page, raw):
+        raw["_scan"] = True                    # 스캔 쪽(글자층이 있어도): 번역 때 쪽 이미지로 기울임·OCR 오류 확인
         layer_raw = raw
         new = _reocr_raw(page, raw)
         if new is not None:
@@ -970,12 +999,13 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
                     bb |= l["bbox"]
                 block_lines.append((bb, part))
 
-    figs = _grow_figures(figs, block_lines, page.rect)
+    figs = [f & page.rect for f in _grow_figures(figs, block_lines, page.rect)]
     # 쪽 머리글 줄(러닝 헤더·쪽 번호)이 그림 위쪽에 걸쳐 있으면 그림을 그 아래부터로
     for fi, f in enumerate(figs):
         for bbox, lines in block_lines:
+            ht = " ".join(l["text"] for l in lines)
             if bbox.y1 < max(62, H * 0.115) + 4 and bbox.intersects(f) and bbox.y1 < f.y0 + 30 \
-                    and len(" ".join(l["text"] for l in lines)) < 100:
+                    and len(ht) < 100 and len(re.findall(r"[A-Za-z]", ht)) >= 3 and not NUMERIC_LABEL_RE.match(ht):
                 figs[fi] = pymupdf.Rect(f.x0, max(f.y0, bbox.y1 + 2), f.x1, f.y1)
                 f = figs[fi]
     blocks: list[dict[str, Any]] = [_figure_block(r, raw, body, page) for r in figs]
@@ -1093,7 +1123,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             if b["kind"] in ("heading", "caption") and b.get("html"):
                 b["html"] = re.sub(r"</?b>", "", b["html"])
     return {"mode": "text", "body_size": body, "blocks": _split_byline(ordered, page.rect),
-            "ocr": bool(raw.get("_reocr"))}
+            "ocr": bool(raw.get("_reocr") or raw.get("_scan"))}
 
 
 TITLE_CASE_SMALL = {"a", "an", "the", "of", "and", "or", "in", "on", "for", "to", "by", "with", "from", "at", "as"}
@@ -1132,12 +1162,38 @@ def _split_centered_lines(lines: list[dict]) -> list[list[dict]]:
     return [p for p in parts if p]
 
 
+def _is_labelish(lines: list[dict]) -> bool:
+    """그래프 눈금·범주명처럼 보이는지: 숫자가 많거나, 낱말 사이가 크게 벌어진(글자 밀도가 낮은) 줄들."""
+    text = " ".join(l["text"] for l in lines)
+    if not text.strip():
+        return False
+    digits = sum(ch.isdigit() or ch in "%()=." for ch in text) / max(1, len(text.replace(" ", "")))
+    if digits > 0.4:
+        return True
+    sparse = sum(1 for l in lines
+                 if len(l["text"].strip()) * max(l.get("size", 9), 1) * 0.45 < l["bbox"].width * 0.6)
+    if sparse >= max(1, len(lines) * 0.5):
+        return True
+    # 같은 높이에 짧은 조각이 셋 이상 띄엄띄엄 놓인 줄(막대그래프 아래 범주명들)
+    rows: dict[int, list] = {}
+    for l in lines:
+        rows.setdefault(round((l["bbox"].y0 + l["bbox"].y1) / 6), []).append(l)
+    for r in rows.values():
+        r.sort(key=lambda l: l["bbox"].x0)
+        gaps = [r[i + 1]["bbox"].x0 - r[i]["bbox"].x1 for i in range(len(r) - 1)]
+        if len(r) >= 3 and sum(g > max(r[0].get("size", 9), 1) * 1.2 for g in gaps) >= 2:
+            return True
+    return False
+
+
 def _is_prose(lines: list[dict]) -> bool:
     """본문 문장처럼 보이는지: 소문자 단어가 많은 긴 줄이 둘 이상."""
     n = 0
     for l in lines:
         words = re.findall(r"[a-z]{2,}", l["text"])
-        if len(words) >= 6:
+        # 글자 밀도: 본문 줄은 글자가 빽빽하고, 그래프 범주명 줄은 낱말 사이가 크게 벌어져 있다
+        dense = len(l["text"].strip()) * max(l.get("size", 9), 1) * 0.45 >= l["bbox"].width * 0.75
+        if len(words) >= 6 and dense:
             n += 1
     return n >= 2
 
@@ -1155,18 +1211,18 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
             if k in taken:
                 continue
             text = " ".join(l["text"].strip() for l in lines)
-            if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or bbox.y1 < max(62, H * 0.115) \
-                    or bbox.y0 > H - 70:
+            in_head_band = bbox.y1 < max(62, H * 0.115) and not NUMERIC_LABEL_RE.match(text)
+            if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or in_head_band or bbox.y0 > H - 70:
                 continue
             # 그림 높이 안에 통째로 들어 있는 '문장이 아닌' 글(나란히 놓인 다른 그래프의 눈금·범주명)
             inside = next((fi for fi, f in enumerate(figs) if bbox.y0 >= f.y0 - 4 and bbox.y1 <= f.y1 + 4
-                           and not f.contains(bbox) and not _is_prose(lines)), None)
+                           and not f.contains(bbox) and _is_labelish(lines)), None)
             if inside is not None:
                 figs[inside] = pymupdf.Rect(figs[inside]) | bbox
                 taken.add(k)
                 changed = True
                 continue
-            if len(text) > 45:
+            if len(text) > 45 and not _is_labelish(lines):
                 continue
             for fi, f in enumerate(figs):
                 if f.contains(bbox):
