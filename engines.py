@@ -696,3 +696,76 @@ def ocr_cost_krw(model: str, n_pages: int) -> int | None:
     _, pin, pout = OPENAI_MODELS[model]
     usd = n_pages * (2_500 / 1e6 * pin + 1_500 / 1e6 * pout)
     return round(usd * USD_KRW)
+
+
+# ─────────────────────────── 그림 속 문구 (OpenAI 이미지 읽기) ───────────────────────────
+FIG_DPI = 220
+FIG_PROMPT = """당신은 수학교육·통계교육 논문의 그림을 읽고 그림 속 문구를 {lang}로 번역하는 학술 번역자다.
+입력은 논문 그림 한 장의 이미지다(캡션은 따로 번역하므로 그림 안의 글자만 다룬다).
+
+- 그림 안에 인쇄된 글자 요소를 빠짐없이 찾는다: 축 제목, 범주명, 범례, 도식 상자 안 글자, 화살표 옆 글자, 표 칸 글자.
+- 여러 줄에 걸친 하나의 범주명·상자 글은 한 항목으로 묶는다. 서로 다른 상자나 범주는 따로 둔다.
+- 순서: 위→아래, 왼→오른쪽. 도식은 화살표 흐름 순서가 분명하면 그 순서.
+- 숫자만 있는 눈금(0%, 10%, 1, 2 …)과 막대 위 수치('82%(n=37)')는 번역할 필요가 없으므로 넣지 않는다.
+- source에는 이미지에 실제로 보이는 원문을 그대로 쓴다. 보이지 않거나 흐려서 확실하지 않은 글자를 추측해 채우지 않는다.
+  일부를 읽을 수 없으면 읽은 부분만 쓰고 status를 "needs_review", review에 위치와 이유를 쓴다. "…"로 대체하지 않는다.
+- translation: 학술적이고 간결한 번역. 고유명사·약어·기호·수치는 그대로 둔다. 별표(*) 등 원문 기호는 유지한다.
+- 그림 내용을 해석하거나 설명을 덧붙이지 않는다.{glossary}
+출력: {{"items": [{{"source": 원문, "translation": 번역, "status": "ok" 또는 "needs_review", "review": ""}}]}}"""
+
+FIG_SCHEMA = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"source": {"type": "string"}, "translation": {"type": "string"},
+                       "status": {"type": "string", "enum": ["ok", "needs_review"]}, "review": {"type": "string"}},
+        "required": ["source", "translation", "status", "review"], "additionalProperties": False}}},
+    "required": ["items"], "additionalProperties": False,
+}
+
+
+def figure_labels(api_key: str, model: str, png: bytes, target: str = "KO",
+                  glossary_entries: dict[str, str] | None = None) -> list[dict]:
+    """그림 이미지 → [{source, translation, status, review}] (그림 속 문구와 번역)."""
+    import openai
+
+    gloss = ""
+    if glossary_entries:
+        gloss = "\n- 용어집(영어 → 번역어): " + "; ".join(f"{en} → {ko}" for en, ko in glossary_entries.items())
+    client = openai.OpenAI(api_key=api_key.strip(), max_retries=3, timeout=180)
+    url = "data:image/png;base64," + base64.b64encode(png).decode()
+    kw: dict[str, Any] = dict(
+        model=model,
+        instructions=FIG_PROMPT.format(lang=LANG_NAME.get(target, target), glossary=gloss),
+        input=[{"role": "user", "content": [
+            {"type": "input_text", "text": "이 그림 속 문구를 읽고 번역하라."},
+            {"type": "input_image", "image_url": url, "detail": "high"},
+        ]}],
+        text={"format": {"type": "json_schema", "name": "figure", "schema": FIG_SCHEMA, "strict": True}},
+    )
+    try:
+        try:
+            resp = client.responses.create(reasoning={"effort": "low"}, **kw)
+        except openai.BadRequestError as e:
+            if "reasoning" not in str(e):
+                raise
+            resp = client.responses.create(**kw)
+        return json.loads(resp.output_text)["items"]
+    except openai.AuthenticationError:
+        raise EngineError("API Key 오류: OpenAI 키가 올바르지 않습니다.", fatal=True)
+    except openai.RateLimitError as e:
+        if "insufficient_quota" in str(e):
+            raise EngineError("OpenAI 크레딧 부족: platform.openai.com에서 충전하세요.", fatal=True)
+        raise EngineError("요청이 너무 많음 — 잠시 후 다시 시도하세요.")
+    except openai.OpenAIError as e:
+        raise EngineError(f"그림 글자 읽기 실패: {e}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise EngineError(f"그림 글자 읽기 결과 형식 오류: {e}")
+
+
+def figure_cost_krw(model: str, n_figs: int) -> int | None:
+    """그림 1개당 이미지 입력 약 1,500토큰 + 출력 약 600토큰으로 거칠게 추정."""
+    if model not in OPENAI_MODELS:
+        return None
+    _, pin, pout = OPENAI_MODELS[model]
+    return round(n_figs * (1_500 / 1e6 * pin + 600 / 1e6 * pout) * USD_KRW)

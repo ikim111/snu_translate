@@ -985,6 +985,11 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             b["kind"] = "note"
 
     _fix_kinds(blocks, page.rect, body)
+    if raw.get("_reocr"):
+        # 획 굵기로 찾은 굵은 글씨: 여러 줄 본문 속 한 단어짜리는 잉크 번짐일 가능성이 커서 버린다
+        for b in blocks:
+            if b["kind"] in ("para", "note", "footnote") and len(b.get("lines") or []) >= 2 and b.get("html"):
+                b["html"] = re.sub(r"<b>(\S+)</b>", r"\1", b["html"])
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
     _carry_across_columns(ordered, page.rect)
@@ -1591,7 +1596,8 @@ def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
         pg["page_number"] = i + 1
         pages.append(pg)
     # 논문 첫 쪽(제목이 있는 쪽, 보통 1쪽이지만 JSTOR 표지가 있으면 2쪽): 위쪽 저널 정보는 지우지 않고 보존
-    ti = next((i for i, p in enumerate(pages[:3]) if any(b.get("title") for b in p.get("blocks", []))), 0)
+    tsz = [max((b["size"] for b in p.get("blocks", []) if b.get("title")), default=0) for p in pages[:3]]
+    ti = max(range(len(tsz)), key=lambda i: tsz[i]) if tsz and max(tsz) > 0 else 0
     if ti and pages[ti]["mode"] == "text":
         for b in pages[ti]["blocks"]:
             if b["kind"] == "header" and not DOWNLOAD_NOTICE_RE.search(b["text"]) and not b.get("noise") \
@@ -1642,11 +1648,7 @@ def translatable_units(pg: dict, translate_refs: bool = False,
     units: list[tuple[int, int | None, str]] = []
     for bi, b in enumerate(pg["blocks"]):
         k = b["kind"]
-        if k == "figure":
-            if translate_captions:
-                units += [(bi, ii, h) for ii, h in enumerate(b.get("items") or [])]
-            continue
-        if k in ("header", "meta"):
+        if k in ("header", "meta", "figure"):     # 그림 속 문구는 따로 처리 (figure_jobs)
             continue
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
@@ -2308,3 +2310,28 @@ def bookmarks(tpages: list[dict]) -> list[list]:
             else:
                 toc.append([2 if has_title else 1, t[:120], i])
     return toc
+
+
+def figure_jobs(pg: dict) -> list[tuple[int, dict]]:
+    """그림 속 문구를 번역할 그림 블록 [(블록 번호, 블록)]."""
+    return [(bi, b) for bi, b in enumerate(pg.get("blocks", [])) if b["kind"] == "figure"]
+
+
+def fig_key(b: dict) -> str:
+    return ",".join(str(round(x)) for x in b["bbox"])
+
+
+def apply_figure_translations(pg: dict, figs: dict) -> None:
+    """캐시의 그림 번역 {그림 위치: {src, tr, review}}을 그림 블록에 붙인다."""
+    for b in pg.get("blocks", []):
+        if b["kind"] != "figure":
+            continue
+        f = figs.get(fig_key(b))
+        if not f:
+            continue
+        b["items"] = [_protect(esc(x)) for x in f.get("src", [])]
+        b["tr_items"] = list(f.get("tr", []))
+        if f.get("review"):
+            b["review"] = " / ".join(f["review"])
+        elif "review" in b:
+            del b["review"]

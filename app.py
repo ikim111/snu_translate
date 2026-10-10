@@ -426,7 +426,10 @@ need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
 done_in_range = sum(1 for pg in sel if has_translation(pg))
 if engine_name == "OpenAI":
     krw = engines.openai_cost_krw(model, need_chars)
-    cost = f" · 예상 비용 약 {krw:,}원" if krw is not None else ""
+    n_figs = sum(len(core.figure_jobs(pg)) for pg in todo)
+    krw_f = engines.figure_cost_krw(model, n_figs) if translate_captions else 0
+    cost = (f" · 예상 비용 약 {krw + (krw_f or 0):,}원" + (f" (그림 {n_figs}개 글자 읽기 포함)" if n_figs and krw_f else "")
+            if krw is not None else "")
 else:
     cost = " (DeepL 남은 한도는 번역 시작 시 확인해 보여 줍니다)"
 st.info(f"선택 범위 {len(sel)}쪽 중 {done_in_range}쪽 번역 완료 · 남은 원문 약 {need_chars:,}자{cost}")
@@ -517,17 +520,46 @@ def make_engine() -> engines.Engine:
     return engines.make_openai(api_key, model, target, glossary_entries)
 
 
-def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict]) -> tuple[list[str], list[dict]]:
+def figure_pngs(pg: dict) -> dict[str, bytes]:
+    """그림 영역 이미지 (메인 스레드에서 미리 만든다 — PyMuPDF 문서는 여러 스레드에서 함께 쓰면 안 됨)."""
+    if pg.get("rotated") and pg.get("_rot_key") in core._ROT_DOCS:
+        page = core._ROT_DOCS[pg["_rot_key"]][0]
+    else:
+        page = src[pg["page_number"] - 1]
+    return {core.fig_key(b): page.get_pixmap(clip=b["bbox"], dpi=engines.FIG_DPI).tobytes("png")
+            for _, b in core.figure_jobs(pg)}
+
+
+def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
+                   pngs: dict[str, bytes]) -> tuple[list[str], list[dict], dict]:
     """한 쪽 번역. 쪽 경계에서 이어지는 문장은 앞뒤 쪽 원문을 '참고 맥락'으로 함께 보낸다(옮기지는 않음).
-    반환: (번역 목록, 검토가 필요한 조각 [{id, review}])"""
+    그림 속 문구는 OpenAI면 그림 이미지를 직접 읽어 번역하고, DeepL이면 무료 OCR로 읽은 문구를 번역한다.
+    반환: (번역 목록, 검토가 필요한 조각 [{id, review}], 그림 번역 {그림 위치: {src, tr, review}})"""
     units = units_of(pg)
-    if not units:
-        return [], []
-    meta = core.unit_meta(all_pages, pg, units)
-    tr = engine.translate([h for *_, h in units], meta)
-    reviews = [{"id": m["id"], "review": m.get("review", "")} for m in meta
-               if m.get("status") == "needs_review" or m.get("review")]
-    return tr, reviews
+    tr: list[str] = []
+    reviews: list[dict] = []
+    if units:
+        meta = core.unit_meta(all_pages, pg, units)
+        tr = engine.translate([h for *_, h in units], meta)
+        reviews = [{"id": m["id"], "review": m.get("review", "")} for m in meta
+                   if m.get("status") == "needs_review" or m.get("review")]
+    figs: dict = {}
+    for bi, b in core.figure_jobs(pg):
+        key = core.fig_key(b)
+        if engine_name == "OpenAI" and translate_captions:
+            items = engines.figure_labels(api_key, model, pngs[key], target, glossary_entries)
+            f = {"src": [x["source"] for x in items], "tr": [x["translation"] for x in items],
+                 "review": [f'{x["source"]}: {x["review"] or "판독 확인 필요"}' for x in items
+                            if x["status"] == "needs_review"]}
+        elif b.get("items") and translate_captions:
+            srcs = [core.plain(h) for h in b["items"]]
+            f = {"src": srcs, "tr": engine.translate(b["items"]), "review": [b["review"]] if b.get("review") else []}
+        else:
+            continue
+        figs[key] = f
+        for r in f["review"]:
+            reviews.append({"id": core.unit_id(pg["page_number"], bi, None), "review": f"그림 속 문구 — {r}"})
+    return tr, reviews, figs
 
 
 def run_translation(targets: list[dict]) -> None:
@@ -556,14 +588,15 @@ def run_translation(targets: list[dict]) -> None:
     # 페이지 단위로 번역하고, 끝나는 대로 저장한다. OpenAI는 여러 페이지를 동시에 보낸다.
     done = 0
     with ThreadPoolExecutor(max_workers=engine.workers) as pool:
-        futures = {pool.submit(translate_page, engine, pg, pages): pg for pg in targets}
+        pngs = {pg["page_number"]: figure_pngs(pg) for pg in targets}
+        futures = {pool.submit(translate_page, engine, pg, pages, pngs[pg["page_number"]]): pg for pg in targets}
         status.write(f"번역 중… 0 / {len(targets)}쪽")
         for fut in as_completed(futures):
             pg = futures[fut]
             pno = pg["page_number"]
             try:
-                tr, reviews = fut.result()
-                cache[str(pno)] = {"tr": tr, "sig": units_sig(pg), "review": reviews,
+                tr, reviews, figs = fut.result()
+                cache[str(pno)] = {"tr": tr, "sig": units_sig(pg), "review": reviews, "figs": figs,
                                    "pv": engines.PROMPT_VERSION if engine_name == "OpenAI" else "",
                                    "original": core.page_text(pg, translated=False)}
                 save_cache(cache_key, cache)
@@ -622,6 +655,8 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
     if redo:
         rc = sum(len(core.plain(h)) for pg in redo for *_, h in units_of(pg))
         krw2 = engines.openai_cost_krw(model, rc) if engine_name == "OpenAI" else None
+        if krw2 is not None and translate_captions:
+            krw2 += engines.figure_cost_krw(model, sum(len(core.figure_jobs(pg)) for pg in redo)) or 0
         st.caption(f"{len(redo)}쪽 · 원문 약 {rc:,}자" + (f" · 예상 비용 약 {krw2:,}원" if krw2 is not None else ""))
     if st.button("이 쪽만 다시 번역", disabled=not redo):
         run_translation(redo)
@@ -635,6 +670,7 @@ def translated_page(pg: dict) -> dict | None:
         return None
     tpg = copy.deepcopy(pg)
     core.apply_translations(tpg, units_of(tpg), entry["tr"])
+    core.apply_figure_translations(tpg, entry.get("figs") or {})
     return tpg
 
 
