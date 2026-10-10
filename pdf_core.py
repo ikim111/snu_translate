@@ -535,11 +535,43 @@ def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
     td = _tessdata()
     if not td:
         return None
+    # 세로로 인쇄된 여백 글(저작권 안내 등)은 OCR하면 기호 쓰레기가 된다 → 원래 글자층에서 위치를 찾아 지우고 읽는다
+    rot_rects = [pymupdf.Rect(l["bbox"]) for b in old_raw.get("blocks", []) for l in b.get("lines", [])
+                 if abs(l["dir"][0] - 1) > 0.01]
     try:
-        tp = page.get_textpage_ocr(language="eng", dpi=300, full=True, tessdata=td)
-        raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES, textpage=tp)
+        if rot_rects:
+            dpi = 300
+            k = dpi / 72
+            pix = page.get_pixmap(dpi=dpi)
+            for r in rot_rects:
+                ir = pymupdf.IRect(int((r.x0 - 2) * k), int((r.y0 - 2) * k), int((r.x1 + 2) * k), int((r.y1 + 2) * k))
+                pix.set_rect(ir & pix.irect, (255,) * pix.n)
+            tmp = pymupdf.open()
+            tpg = tmp.new_page(width=page.rect.width, height=page.rect.height)
+            tpg.insert_image(tpg.rect, pixmap=pix)
+            tp = tpg.get_textpage_ocr(language="eng", dpi=dpi, full=True, tessdata=td)
+            raw = tpg.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES, textpage=tp)
+        else:
+            tp = page.get_textpage_ocr(language="eng", dpi=300, full=True, tessdata=td)
+            raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES, textpage=tp)
     except Exception:
         return None
+    # 그래도 남은 여백의 짧은 기호 쓰레기 줄(쪽 가장자리 40pt 안, 단어다운 글자가 거의 없음)은 버린다
+    W_ = page.rect.width
+    for b in raw["blocks"]:
+        if b.get("type") != 0:
+            continue
+        keep = []
+        for l in b["lines"]:
+            t = "".join(c["c"] for sp in l["spans"] for c in sp["chars"]).strip()
+            x0, _, x1, _ = l["bbox"]
+            edge = x1 < 45 or x0 > W_ - 45
+            if edge and len(re.findall(r"[A-Za-z]{3,}", t)) == 0:
+                continue
+            if len(t) <= 3 and not re.search(r"[A-Za-z0-9]", t):
+                continue                      # 점·선 조각('.', '_.', '—')
+            keep.append(l)
+        b["lines"] = keep
     chars = sum(len(s["chars"]) for b in raw["blocks"] for l in b.get("lines", []) for s in l["spans"])
     if chars < 200:
         return None
@@ -587,10 +619,51 @@ def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
                     else:
                         out.append(ch[i]); i += 1
                 sp["chars"] = out
+    _split_ocr_columns(raw, page.rect)
     _align_with_layer(raw, layer_words)
     _mark_bold_by_ink(page, raw)
     raw["_reocr"] = True
     return raw
+
+
+def _split_ocr_columns(raw: dict, page_rect: pymupdf.Rect) -> None:
+    """tesseract는 2단 쪽에서 왼쪽·오른쪽 단의 줄을 한 블록으로 묶기도 한다 → 단 사이 여백에서 블록을 나눈다."""
+    W = page_rect.width
+    lines = [l for b in raw["blocks"] if b.get("type") == 0 for l in b.get("lines", [])]
+    if len(lines) < 20:
+        return
+    best_g, best_n = None, None
+    for g in range(int(W * 0.4), int(W * 0.6)):
+        n = sum(1 for l in lines if l["bbox"][0] < g - 1 and l["bbox"][2] > g + 1)
+        if best_n is None or n < best_n:
+            best_g, best_n = g, n
+    left = sum(1 for l in lines if l["bbox"][2] <= best_g + 2)
+    right = sum(1 for l in lines if l["bbox"][0] >= best_g - 2)
+    if best_n > len(lines) * 0.08 or left < len(lines) * 0.2 or right < len(lines) * 0.2:
+        return
+    out = []
+    for b in raw["blocks"]:
+        if b.get("type") != 0:
+            out.append(b)
+            continue
+        groups = {"span": [], "left": [], "right": []}
+        for l in b["lines"]:
+            if l["bbox"][2] <= best_g + 2:
+                groups["left"].append(l)
+            elif l["bbox"][0] >= best_g - 2:
+                groups["right"].append(l)
+            else:
+                groups["span"].append(l)
+        parts = [v for v in groups.values() if v]
+        if len(parts) <= 1:
+            out.append(b)
+            continue
+        for ls in parts:
+            bb = pymupdf.Rect(ls[0]["bbox"])
+            for l in ls[1:]:
+                bb |= pymupdf.Rect(l["bbox"])
+            out.append(dict(b, lines=ls, bbox=tuple(bb)))
+    raw["blocks"] = out
 
 
 def _fix_drop_caps(raw: dict) -> None:
@@ -851,7 +924,10 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
     if _in_rotated:
         raw = _reocr_raw(page, raw) or raw
     elif _page_is_image_backed(page) and not is_scanned(page, raw):
+        layer_raw = raw
         new = _reocr_raw(page, raw)
+        if new is not None:
+            new["_layer_raw"] = layer_raw
         if new is not None and _word_quality(new) < 0.5:
             # 가로로 돌려 인쇄한 스캔 표: 돌려서 다시 읽어 본다
             rot = _extract_rotated_scan(page)
@@ -872,7 +948,8 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             return {"mode": "image", "body_size": body, "blocks": []}
         return {"mode": "text", "body_size": table["size"], "blocks": [table]}
 
-    figs = _figure_regions(page, raw)
+    # 그림 찾기는 원래 글자층 기준(OCR은 그래프의 점·눈금을 글자로 읽어 그림 잉크를 가린다)
+    figs = _figure_regions(page, raw.get("_layer_raw") or raw)
 
     # 줄 단위로 먼저 읽는다 (선 없는 표를 찾으려면 블록을 가로질러 줄을 봐야 함)
     block_lines: list[tuple[pymupdf.Rect, list[dict]]] = []
@@ -887,9 +964,20 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
         for x in lines:
             x["id"] = id(x)
         if lines:
-            block_lines.append((pymupdf.Rect(b["bbox"]), lines))
+            for part in _split_centered_lines(lines):
+                bb = pymupdf.Rect(part[0]["bbox"])
+                for l in part[1:]:
+                    bb |= l["bbox"]
+                block_lines.append((bb, part))
 
     figs = _grow_figures(figs, block_lines, page.rect)
+    # 쪽 머리글 줄(러닝 헤더·쪽 번호)이 그림 위쪽에 걸쳐 있으면 그림을 그 아래부터로
+    for fi, f in enumerate(figs):
+        for bbox, lines in block_lines:
+            if bbox.y1 < max(62, H * 0.115) + 4 and bbox.intersects(f) and bbox.y1 < f.y0 + 30 \
+                    and len(" ".join(l["text"] for l in lines)) < 100:
+                figs[fi] = pymupdf.Rect(f.x0, max(f.y0, bbox.y1 + 2), f.x1, f.y1)
+                f = figs[fi]
     blocks: list[dict[str, Any]] = [_figure_block(r, raw, body, page) for r in figs]
 
     def in_fig(r: pymupdf.Rect) -> bool:
@@ -962,10 +1050,13 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             kind = "caption"
         elif size < body * 0.85 and bbox.y0 > H * 0.45:
             kind = "footnote"           # 각주, 교신저자 안내 등 페이지 아래 작은 글씨
-        elif len(plain) < 120 and size > body * 1.15:
-            kind = "heading"            # 큰 글씨 = 제목 (문장부호로 끝나도)
+        elif len(plain) < 120 and size > body * 1.15 and (
+                not raw.get("_reocr") or _is_title_case(plain) or plain.isupper()
+                or len({round(l["bbox"].y0 / 4) for l in lines}) > 1):
+            kind = "heading"            # 큰 글씨 = 제목 (문장부호로 끝나도). OCR 글자 크기는 들쭉날쭉해 한 줄은 Title Case만
         elif len(plain) < 80 and not SENTENCE_END_RE.search(plain) and (
-            plain.isupper() or lines[0]["sans"].strip() == plain or all(l.get("bold") for l in lines)
+            plain.isupper() or lines[0]["sans"].strip() == plain
+            or (all(l.get("bold") for l in lines) and (not raw.get("_reocr") or _is_title_case(plain)))
             or NUMBERED_HEADING_RE.match(plain)
         ):
             kind = "heading"
@@ -1017,6 +1108,30 @@ def _is_title_case(t: str) -> bool:
 NUMERIC_LABEL_RE = re.compile(r"^[\d\s.,%()=<>+\-–—/:*n]*$")
 
 
+def _split_centered_lines(lines: list[dict]) -> list[list[dict]]:
+    """한 블록 안에 가운데 정렬된 짧은 줄(소제목 'References')이 끼어 있으면 그 줄을 따로 떼어 낸다.
+    문단 끝줄은 왼쪽 정렬이라 걸리지 않는다."""
+    if len(lines) < 2:
+        return [lines]
+    x0 = min(l["bbox"].x0 for l in lines)
+    x1 = max(l["bbox"].x1 for l in lines)
+    mid, width = (x0 + x1) / 2, x1 - x0
+    parts: list[list[dict]] = [[]]
+    for i, l in enumerate(lines):
+        lc = (l["bbox"].x0 + l["bbox"].x1) / 2
+        t = l["text"].strip()
+        heading_like = (l["bbox"].width < width * 0.5 and abs(lc - mid) < 12 and l["bbox"].x0 > x0 + 15
+                        and len(t) < 60 and not SENTENCE_END_RE.search(t) and t[:1].isupper())
+        if heading_like:
+            if parts[-1]:
+                parts.append([])
+            parts[-1].append(l)
+            parts.append([])
+        else:
+            parts[-1].append(l)
+    return [p for p in parts if p]
+
+
 def _is_prose(lines: list[dict]) -> bool:
     """본문 문장처럼 보이는지: 소문자 단어가 많은 긴 줄이 둘 이상."""
     n = 0
@@ -1040,7 +1155,8 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
             if k in taken:
                 continue
             text = " ".join(l["text"].strip() for l in lines)
-            if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or bbox.y1 < 62 or bbox.y0 > H - 70:
+            if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or bbox.y1 < max(62, H * 0.115) \
+                    or bbox.y0 > H - 70:
                 continue
             # 그림 높이 안에 통째로 들어 있는 '문장이 아닌' 글(나란히 놓인 다른 그래프의 눈금·범주명)
             inside = next((fi for fi, f in enumerate(figs) if bbox.y0 >= f.y0 - 4 and bbox.y1 <= f.y1 + 4
@@ -1200,6 +1316,23 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
     - 쪽 위 머리글 구역에 걸린 '본문 폭의 줄'이 바로 아래 문단과 붙어 있으면 본문 (쪽 첫 줄)
     - 위아래가 비어 있는 짧은 Title Case 한 줄('Conceptual Framework')은 소제목"""
     W = page_rect.width
+    # OCR이 캡션 줄을 좌우 두 조각으로 나눈 경우('Figure 9.' | 'Box plots of …'): 같은 높이 띠의 조각을 캡션에 합친다
+    for b in [x for x in blocks if x["kind"] in ("para", "note", "caption") and CAPTION_RE.match(x.get("text", ""))]:
+        if b not in blocks or not b.get("lines"):
+            continue
+        band = [o for o in blocks if o is not b and o["kind"] in ("para", "note") and o.get("lines")
+                and (abs(o["bbox"].y0 - b["bbox"].y0) <= 3
+                     or (o["bbox"].y0 >= b["bbox"].y0 - 3 and o["bbox"].y1 <= b["bbox"].y1 + 3))
+                and len(o["lines"]) <= 8]
+        if band:
+            ls = list(b["lines"]) + [l for o in band for l in o["lines"]]
+            ls.sort(key=lambda l: (round(l["bbox"].y0 / 4), l["bbox"].x0))
+            h_, t_ = join_lines(ls)
+            bb = pymupdf.Rect(b["bbox"])
+            for o in band:
+                bb |= o["bbox"]
+                blocks.remove(o)
+            b.update(html=_protect(h_), text=t_, lines=ls, bbox=bb)
     figs = [b["bbox"] for b in blocks if b["kind"] in ("figure", "table")]
     for b in blocks:
         if b["kind"] in ("para", "note", "heading") and CAPTION_RE.match(b["text"]) and any(
@@ -1812,7 +1945,7 @@ def to_reading_html(tr_html: str, italic_to_bold: bool = True) -> str:
     return s
 
 
-def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
+def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0) -> list[str]:
     """번역된 블록 → HTML 조각 목록. 각주는 맨 끝에 구분선과 함께."""
     out: list[str] = []
     for bi, b in enumerate(blocks):
@@ -1861,14 +1994,21 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             # 참고문헌은 학술지명 이탤릭을 볼드로 바꾸지 않는다 (지저분해짐)
             out.append(f'<p class="ref">{to_reading_html(tr, italic_to_bold=False)}</p>')
         elif k == "figure" and b.get("img_name"):
-            w, h = b["bbox"].width, b["bbox"].height
+            w, h = b["bbox"].width * fig_scale, b["bbox"].height * fig_scale
             if w > box_width - 4:                       # 단 폭보다 넓으면 비율 유지하며 줄인다
                 h, w = h * (box_width - 4) / w, box_width - 4
             out.append(f'<p class="fig"><img src="{b["img_name"]}" width="{w:.0f}" height="{h:.0f}"/></p>')
             if b.get("tr_items") and b.get("items"):
                 # 그림 속 문구: 원문 | 번역 (그림은 원본 그대로 두어 글자·수치를 가리지 않는다)
-                rows = "".join(f'<tr><td class="src">{esc(plain(o))}</td><td>{to_reading_html(t)}</td></tr>'
-                               for o, t in zip(b["items"], b["tr_items"]))
+                pairs = [(esc(plain(o)), to_reading_html(t)) for o, t in zip(b["items"], b["tr_items"])]
+                cw = box_width / 4 - 8
+                if len(pairs) >= 4 and box_width > 250:   # 짧은 문구가 많으면 두 쌍씩 한 줄에
+                    rows = "".join(
+                        "<tr>" + "".join(f'<td class="src" style="width:{cw:.0f}pt">{o}</td>'
+                                         f'<td style="width:{cw:.0f}pt">{t}</td>' for o, t in pairs[i:i + 2]) + "</tr>"
+                        for i in range(0, len(pairs), 2))
+                else:
+                    rows = "".join(f'<tr><td class="src">{o}</td><td>{t}</td></tr>' for o, t in pairs)
                 out.append(f'<table class="figlab">{rows}</table>')
     foot = [b for b in blocks if b["kind"] == "footnote"]
     if foot:
@@ -1988,13 +2128,27 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
             b["img_name"] = name
 
     regions = page_regions(blocks, src.rect)
-    html = [("".join(_pieces(bl, r.width)), r) for r, bl in regions]
-    html = [(h, r) for h, r in html if h]
-    if not html:
-        html = [('<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>', pymupdf.Rect(40, 60, W - 40, 120))]
+    def build(scale: float) -> list:
+        h_ = [("".join(_pieces(bl, r.width, scale)), r) for r, bl in regions]
+        h_ = [(h, r) for h, r in h_ if h]
+        return h_ or [('<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>',
+                       pymupdf.Rect(40, 60, W - 40, 120))]
 
-    font, lh, compact = _fit(html, W, H, archive, pg["body_size"])
+    # 그림이 있는 쪽에서 글이 넘치면, 글자를 줄이기 전에 그림을 비율 그대로 조금 줄여 본다 (최대 70%까지)
+    has_fig = any(b["kind"] == "figure" for b in blocks)
+    target = pg["body_size"] * FONT_BOOST
+    best = None
+    for scale in ((1.0, 0.85, 0.7) if has_fig else (1.0,)):
+        html = build(scale)
+        font, lh, compact = _fit(html, W, H, archive, pg["body_size"])
+        cand = (font or 0, scale, html, font, lh, compact)
+        if best is None or cand[0] > best[0] + 0.05:
+            best = cand
+        if font is not None and font >= target * 0.97:
+            break
+    _, fig_scale, html, font, lh, compact = best
     pg["_render"] = {"font": font and round(font, 2), "lh": lh, "compact": compact, "fit": font is not None,
+                     "fig_scale": fig_scale,
                      "target_font": round(pg["body_size"] * FONT_BOOST, 2),
                      "min_font": round(pg["body_size"] * MIN_FONT_RATIO, 2)}
     page = out.new_page(width=W, height=H)
