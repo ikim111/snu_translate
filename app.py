@@ -106,6 +106,18 @@ def render_library() -> None:
             st.caption(f"{m.get('updated', '')} · {m.get('engine', '')} · "
                        f"번역 {m.get('translated', '?')}/{m.get('total_pages', '?')}쪽 "
                        f"(p.{m.get('range', ['?', '?'])[0]}–{m.get('range', ['?', '?'])[1]}) · {m.get('filename', '')}")
+            if st.button("🧩 열어서 고치기 (원문을 다시 올리지 않아도 됨)", key=f"open_{pid}", type="primary"):
+                try:
+                    data = lib.get_file(pid, "original.pdf")
+                except library.LibraryError as e:
+                    st.error(str(e))
+                    data = None
+                if data:
+                    st.session_state.opened = {"name": m.get("filename") or f"{pid}.pdf", "bytes": data}
+                    st.session_state.goto_translate = True
+                    st.rerun()
+                else:
+                    st.warning("서재에 원문이 없습니다. 번역하기 화면에서 원문 PDF를 올려 주세요.")
             b1, b2, b3 = st.columns([2, 2, 1])
             for col, name, label, mime in ((b1, "translation.pdf", "📕 번역 PDF", "application/pdf"),
                                            (b2, "original.pdf", "📄 원문 PDF", "application/pdf")):
@@ -139,7 +151,9 @@ def render_library() -> None:
 
 # ─────────────────────────── 사이드바 ───────────────────────────
 with st.sidebar:
-    menu = st.radio("메뉴", ["번역하기", "📚 내 서재"], horizontal=True, label_visibility="collapsed")
+    if st.session_state.pop("goto_translate", False):
+        st.session_state.menu = "번역하기"
+    menu = st.radio("메뉴", ["번역하기", "📚 내 서재"], horizontal=True, label_visibility="collapsed", key="menu")
 if menu == "📚 내 서재":
     render_library()
     st.stop()
@@ -238,8 +252,30 @@ def save_cache(key: str, data: dict[str, Any]) -> None:
 st.title("📄 논문 정독용 번역기")
 st.caption("원문 1쪽 = 번역 1쪽. 그림·표는 원문 그대로, 이탤릭은 볼드로 표시됩니다.")
 
+class _Opened:
+    """서재에서 연 원문 (올린 파일과 같은 모양으로 쓴다)."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name, self._data = name, data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
 uploaded = st.file_uploader("논문 PDF를 끌어다 놓으세요", type=["pdf"])
+if uploaded is not None:
+    st.session_state.pop("opened", None)          # 새로 올린 파일이 우선
+elif st.session_state.get("opened"):
+    op = st.session_state.opened
+    oc1, oc2 = st.columns([5, 1])
+    oc1.info(f"📚 서재에서 연 논문: **{op['name']}** — 이전 번역본도 서재에서 자동으로 불러옵니다. "
+             "고칠 쪽은 아래 '🧩 마음에 안 드는 쪽만 다시 번역'에 적으세요.")
+    if oc2.button("닫기"):
+        st.session_state.pop("opened", None)
+        st.rerun()
+    uploaded = _Opened(op["name"], op["bytes"])
 if not uploaded:
+    st.caption("또는 사이드바의 **📚 내 서재**에서 예전에 번역한 논문을 '열어서 고치기'로 바로 열 수 있습니다.")
     st.stop()
 
 pdf_bytes = uploaded.getvalue()
