@@ -1002,10 +1002,13 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
     빠지지 않게 그림 영역을 넓힌다. 캡션·쪽 머리글 띠·긴 본문은 넣지 않는다."""
     H = page_rect.height
     figs = [pymupdf.Rect(f) for f in figs]
+    taken: set[int] = set()
     changed = True
     while changed:
         changed = False
-        for bbox, lines in block_lines:
+        for k, (bbox, lines) in enumerate(block_lines):
+            if k in taken:
+                continue
             text = " ".join(l["text"].strip() for l in lines)
             if len(text) > 45 or CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) \
                     or bbox.y1 < 62 or bbox.y0 > H - 70:
@@ -1017,6 +1020,7 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
                 xov = min(bbox.x1, f.x1) - max(bbox.x0, f.x0)
                 if near.intersects(bbox) and xov >= bbox.width * 0.6:
                     f |= bbox
+                    taken.add(k)
                     changed = True
                     break
     return figs
