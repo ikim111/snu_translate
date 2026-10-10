@@ -292,8 +292,12 @@ def table_pieces(block: dict, to_html, box_width: float = 560.0) -> list[str]:
             bl = set(lay.get("bulleted", []))
             body = "".join(f'<p class="ti">• {get(i)}</p>' if i in bl else f'<p class="tp">{get(i)}</p>'
                            for i in idxs)
-            cells.append(f'<td style="width:{w:.0f}pt">{body}</td>')
+            src_txt = " ".join(re.sub(r"<[^>]+>", "", block["items"][i]) for i in idxs).strip()
+            num = c > 0 and bool(re.fullmatch(r"[\d\s.,%()=<>+\-–—/n*]*", src_txt))
+            cells.append(f'<td class="{"num" if num else ""}" style="width:{w:.0f}pt">{body}</td>')
         cls = "tbl first" if r == 0 else "tbl"
+        if r == len(lay["rows"]) - 1:
+            cls += " last"
         pieces.append(f'<table class="{cls}">' + (head if r == 0 else "") +
                       "<tr>" + "".join(cells) + "</tr></table>")
     if lay.get("note") is not None:

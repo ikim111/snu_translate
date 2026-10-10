@@ -30,7 +30,7 @@
 | `rotated_table.py` | 가로로 돌려 놓은 표 페이지의 칸 구조 읽기·표로 다시 그리기 |
 | `text_table.py` | 선 없이 글자로만 된 표 찾기 |
 | `pdf_core.py` | PDF 추출, 읽기 순서(2단 포함), 문단 복원, 그림·표·참고문헌, 번역 PDF 조판 |
-| `fonts/` | 번역 PDF용 한글 글꼴 (나눔고딕, SIL OFL) |
+| `fonts/` | 번역 PDF용 한글 글꼴 (Noto Sans CJK KR, SIL OFL) |
 
 ## 내 컴퓨터에서 실행
 

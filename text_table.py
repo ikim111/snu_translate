@@ -16,11 +16,12 @@ text_table.py — 괘선이 없거나 적은 '글자로만 된 표'를 찾아 �
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pymupdf
 
-MAX_CELL_CHARS = 25
+MAX_CELL_CHARS = 34
 MIN_GAP = 15
 COL_TOL = 6
 
@@ -67,39 +68,46 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         if len(cands) < 3:
             i = j + 1
             continue
-        xs = sorted(c["bbox"].x0 for r in cands for c in r)
-        cols: list[list[float]] = []
-        for x in xs:
-            if cols and x - cols[-1][-1] <= COL_TOL:
-                cols[-1].append(x)
+        # 열: 여러 행의 칸이 가로로 겹치는 범위끼리 묶는다 (가운데 정렬된 숫자 칸도 한 열로)
+        spans_x = sorted((c["bbox"].x0, c["bbox"].x1) for r in cands for c in r)
+        groups: list[list[float]] = []          # [x0, x1, count]
+        for x0, x1 in spans_x:
+            if groups and x0 <= groups[-1][1] + 2:
+                groups[-1][1] = max(groups[-1][1], x1)
+                groups[-1][2] += 1
             else:
-                cols.append([x])
-        cols = [c for c in cols if len(c) >= max(2, len(cands) * 0.5)]
-        if len(cols) < 2:
+                groups.append([x0, x1, 1])
+        groups = [g for g in groups if g[2] >= max(2, len(cands) * 0.25)]
+        if len(groups) < 2:
             i = j + 1
             continue
-        col_x = [min(c) for c in cols]
+        col_x = [g[0] for g in groups]
+        if os.environ.get("TT_DEBUG"):
+            print("GROUPS", [(round(g[0]), round(g[1]), g[2]) for g in groups], len(cands))
 
-        def col_of(x: float) -> int | None:
-            for k, cx in enumerate(col_x):
-                if abs(x - cx) <= COL_TOL:
-                    return k
-            return None
+        def col_of(c: dict) -> int | None:
+            x0, x1 = c["bbox"].x0, c["bbox"].x1
+            best, ov = None, 0.0
+            for k, g in enumerate(groups):
+                o = min(x1, g[1]) - max(x0, g[0])
+                if o > ov:
+                    best, ov = k, o
+            return best
 
         # 3) 표의 가로 범위 안에 있는 칸만 본다 (같은 높이의 다른 단 글은 무시)
         xmax = max(c["bbox"].x1 for r in cands for c in r) + 6
         xmin = col_x[0] - 10
 
         def in_range(c: dict) -> bool:
-            return xmin <= c["bbox"].x0 <= xmax
+            return xmin <= c["bbox"].x0 <= xmax and c["bbox"].x1 <= xmax + 20
 
         ranged = [[c for c in r if in_range(c)] for r in run]
         ranged = [r for r in ranged if r]
         def data_like(r: list[dict]) -> bool:
-            return is_candidate(r) and len(r) >= 2 and sum(col_of(c["bbox"].x0) is not None for c in r) >= 2
+            return is_candidate(r) and len(r) >= 2 and sum(col_of(c) is not None for c in r) >= 2
 
         def has_num(r: list[dict]) -> bool:
-            return any(any(ch.isdigit() for ch in c["text"]) for c in r if col_of(c["bbox"].x0) != 0)
+            return any(any(ch.isdigit() for ch in c["text"]) for c in r if col_of(c) != 0)
 
         # 첫 데이터 행: 숫자 칸이 있는 첫 행 (숫자 표가 아니면 첫 후보 행)
         numeric_table = sum(has_num(r) for r in ranged if data_like(r)) >= 3
@@ -112,7 +120,7 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         while top - 1 >= 0:
             r = ranged[top - 1]
             gap = ranged[top][0]["_yc"] - r[0]["_yc"]
-            only_col0 = all(col_of(c["bbox"].x0) == 0 for c in r) and len(r) == 1
+            only_col0 = all(col_of(c) == 0 for c in r) and len(r) == 1
             if gap > r[0]["size"] * 2.6 or only_col0:
                 break
             top -= 1
@@ -127,16 +135,42 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         for r in run:
             used.add(id(r))
 
-        def nearest(x: float) -> int:
-            return min(range(len(col_x)), key=lambda k: abs(col_x[k] - x))
+        def nearest(c: dict) -> int:
+            k = col_of(c)
+            if k is not None:
+                return k
+            cx = (c["bbox"].x0 + c["bbox"].x1) / 2
+            return min(range(len(groups)), key=lambda k: abs((groups[k][0] + groups[k][1]) / 2 - cx))
 
+        # 머리행 위에 여러 열을 덮는 한 줄('Implementation')이 있으면 묶음 머리글
+        super_row = None
+        cand = ranged[top - 1] if top - 1 >= 0 else None
+        if cand is None:
+            k0 = next((k for k, r in enumerate(rows) if r is run[0]), 0)
+            cand = [c for c in rows[k0 - 1] if in_range(c)] if k0 > 0 else None
+        if cand and len(cand) == 1 and ranged[top][0]["_yc"] - cand[0]["_yc"] <= cand[0]["size"] * 2.6 \
+                and cand[0]["bbox"].x0 > groups[0][1]:
+            super_row = cand[0]
+        # 데이터 바로 위 머리행 줄이 열을 더 잘게 나누면(빈칸이 많은 표) 그 칸들을 열 기준으로 쓴다
+        if first - 1 >= top:
+            hdr = sorted(ranged[first - 1], key=lambda c: c["bbox"].x0)
+            if len(hdr) > len(groups) and all(hdr[k + 1]["bbox"].x0 > hdr[k]["bbox"].x1 for k in range(len(hdr) - 1)):
+                # 첫 열(행 머리글)은 데이터 칸 머리글보다 왼쪽에 있다: 기존 첫 그룹을 유지
+                left = [g for g in groups if g[1] < hdr[0]["bbox"].x0]
+                new = [list(g) for g in left] + [[c["bbox"].x0, c["bbox"].x1, 1] for c in hdr]
+                for k in range(len(new) - 1):            # 이웃 열과의 가운데까지 넓힌다
+                    mid = (new[k][1] + new[k + 1][0]) / 2
+                    new[k][1], new[k + 1][0] = max(new[k][1], mid - 0.01), min(new[k + 1][0], mid + 0.01)
+                groups[:] = new
+                col_x[:] = [g[0] for g in groups]
         header_n = first - top          # 데이터 첫 행 위의 머리행 줄 수
-        tables.append(_build(table_rows, col_x, nearest, header_n))
+        tables.append(_build(table_rows, col_x, nearest, header_n, super_row))
         i = j + 1
     return tables
 
 
-def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0) -> dict[str, Any]:
+def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0,
+           super_row: dict | None = None) -> dict[str, Any]:
     items: list[str] = []
     texts: list[str] = []
     ids: list[int] = []
@@ -152,7 +186,7 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
     for r in rows:
         cells: list[list[int]] = [[] for _ in range(ncol)]
         for c in r:
-            cells[col_of(c["bbox"].x0)].append(add(c))
+            cells[col_of(c)].append(add(c))
         grid.append(cells)
 
     # 머리행: 데이터 위의 여러 줄을 열마다 하나로 합친다 ('Native' + 'American %' → 'Native American %')
@@ -171,12 +205,23 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
                 header[c] = len(items) - 1
         grid = grid[header_n:]
 
-    all_cells = [c for r in rows for c in r]
+    sup = add(super_row) if super_row is not None else None
+    # 행 머리글의 둘째 줄('(n = 26)')만 있는 행은 앞 행 머리글에 붙인다
+    merged: list[list[list[int]]] = []
+    for r in grid:
+        only0 = r[0] and not any(r[1:])
+        if merged and only0 and all(texts[i].lstrip().startswith("(") for i in r[0]):
+            merged[-1][0] += r[0]
+            continue
+        merged.append(r)
+    grid = merged
+
+    all_cells = [c for r in rows for c in r] + ([super_row] if super_row is not None else [])
     x0 = min(c["bbox"].x0 for c in all_cells)
     x1 = max(c["bbox"].x1 for c in all_cells)
     bbox = pymupdf.Rect(x0, min(c["bbox"].y0 for c in all_cells), x1, max(c["bbox"].y1 for c in all_cells))
     size = sorted(c["size"] for c in all_cells)[len(all_cells) // 2]
-    layout = {"title": None, "super": None, "header": header, "rows": grid, "note": None, "bulleted": [],
+    layout = {"title": None, "super": sup, "header": header, "rows": grid, "note": None, "bulleted": [],
               "col_x": [x - x0 for x in col_x] + [x1 - x0], "width": x1 - x0}
     return {"kind": "table", "bbox": bbox, "size": size, "items": items, "layout": layout,
             "html": "", "text": "\n".join(texts), "line_ids": ids}

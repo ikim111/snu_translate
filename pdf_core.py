@@ -38,8 +38,8 @@ import text_table
 
 # ─────────────────────────── 설정 ───────────────────────────
 FONT_DIR = Path(__file__).parent / "fonts"
-FONT_REGULAR = "NanumGothic-Regular.ttf"   # 다른 글꼴로 바꾸려면 fonts/에 넣고 파일명만 변경
-FONT_BOLD = "NanumGothic-Bold.ttf"
+FONT_REGULAR = "NotoSansKR-Regular.ttf"   # Noto Sans CJK KR (SIL OFL). 다른 글꼴은 fonts/에 넣고 파일명만 변경
+FONT_BOLD = "NotoSansKR-Bold.ttf"
 
 LINE_HEIGHT = 1.32        # 번역문 기본 줄간격 (한글은 1.3 안팎이 원문 쪽수에 맞추면서도 읽기 편함)
 FONT_BOOST = 1.08         # 같은 pt라도 한글이 작아 보여서 원문 본문 크기보다 조금 크게 시작
@@ -486,6 +486,291 @@ def _rotated_ratio(raw: dict) -> float:
     return rot / tot if tot else 0.0
 
 
+_TESSDATA: str | None | bool = False
+
+
+def _tessdata() -> str | None:
+    """설치된 tesseract 언어 자료 폴더 (없으면 None)."""
+    global _TESSDATA
+    if _TESSDATA is False:
+        _TESSDATA = None
+        cands = [os.environ.get("TESSDATA_PREFIX", "")]
+        try:
+            cands.append(pymupdf.get_tessdata())
+        except Exception:
+            pass
+        for root in ("/usr/share/tesseract-ocr", "/usr/share/tessdata", "/usr/local/share/tessdata"):
+            for r, _, fs in os.walk(root):
+                if "eng.traineddata" in fs:
+                    cands.append(r)
+        for c in cands:
+            if c and os.path.exists(os.path.join(c, "eng.traineddata")):
+                _TESSDATA = c
+                break
+    return _TESSDATA or None
+
+
+_COMMON_WORDS = set("""a an the of to in on for and or as at by be is are was were it its this that these those
+with from not no we our they their he she his her which who whom what when where how than then
+there also can may might will would should could has have had do does did more most such each other""".split())
+
+
+def _split_joined(word: str, vocab: set[str]) -> int | None:
+    """'vehiclesfor' → 8 ('vehicles'+'for'): 붙어 읽힌 두 단어의 나눌 위치."""
+    w = word.lower()
+    if len(w) < 5 or not w.isalpha() or w in vocab:
+        return None
+    for i in range(len(w) - 1, 0, -1):
+        a, b = w[:i], w[i:]
+        if (a in vocab or a in _COMMON_WORDS) and (b in vocab or b in _COMMON_WORDS) and \
+                (len(a) > 1 or a == "a") and len(b) > 1:
+            return i
+    return None
+
+
+def _reocr_raw(page: pymupdf.Page, old_raw: dict) -> dict | None:
+    """스캔 이미지 + OCR 글자층 PDF: 글자층이 이미지와 어긋나거나 줄 끝이 잘린 경우가 많다
+    ('buildin', '80/6' ← building, 8%). 쪽 이미지를 tesseract로 다시 읽어 글자층을 바꾼다.
+    tesseract가 없으면 None (원래 글자층 사용)."""
+    td = _tessdata()
+    if not td:
+        return None
+    try:
+        tp = page.get_textpage_ocr(language="eng", dpi=300, full=True, tessdata=td)
+        raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES, textpage=tp)
+    except Exception:
+        return None
+    chars = sum(len(s["chars"]) for b in raw["blocks"] for l in b.get("lines", []) for s in l["spans"])
+    if chars < 200:
+        return None
+    _fix_drop_caps(raw)
+    # tesseract 단어 = span. 단어 사이 공백이 빠진 곳('article'+'focuses')에 공백을 넣는다
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            prev = None
+            for sp in l["spans"]:
+                if not sp["chars"]:
+                    continue
+                if prev is not None and not prev["chars"][-1]["c"].isspace() and not sp["chars"][0]["c"].isspace():
+                    c0 = dict(sp["chars"][0]); c0["c"] = " "
+                    sp["chars"].insert(0, c0)
+                prev = sp
+    layer_words = page.get_text("words")
+    # 원래 글자층의 단어로 사전을 만들어, OCR이 붙여 읽은 단어를 나눈다 ('articlefocuses')
+    vocab = {w.lower() for w in re.findall(r"[A-Za-z]+", " ".join(w[4] for w in layer_words))}
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                ch = sp["chars"]
+                out: list[dict] = []
+                i = 0
+                while i < len(ch):
+                    j = i
+                    while j < len(ch) and ch[j]["c"].isalpha():
+                        j += 1
+                    if j > i:
+                        word = "".join(c["c"] for c in ch[i:j])
+                        cut = _split_joined(word, vocab)
+                        out += ch[i:j]
+                        if cut:
+                            k = len(out) - (j - i) + cut
+                            sp_c = dict(out[k - 1]); sp_c["c"] = " "
+                            out.insert(k, sp_c)
+                        i = j
+                    else:
+                        out.append(ch[i]); i += 1
+                sp["chars"] = out
+    _align_with_layer(raw, layer_words)
+    _mark_bold_by_ink(page, raw)
+    raw["_reocr"] = True
+    return raw
+
+
+def _fix_drop_caps(raw: dict) -> None:
+    """문단 첫 글자를 크게 쓴 장식 대문자(drop cap): OCR이 둘째 줄 앞에 붙여 읽는다
+    ('he mathematics …' / 'Tgoals for …'). 첫 줄 맨 앞으로 옮기고 줄 상자를 글자에 맞춰 다시 잡는다."""
+    for b in raw["blocks"]:
+        lines = b.get("lines") or []
+        if len(lines) < 2:
+            continue
+        hs = [c["bbox"][3] - c["bbox"][1] for l in lines for sp in l["spans"] for c in sp["chars"]
+              if c["c"].isalpha()]
+        if len(hs) < 20:
+            continue
+        med = statistics.median(hs)
+        bx0 = min(l["bbox"][0] for l in lines)
+        for l in lines[1:3]:
+            sp0 = next((sp for sp in l["spans"] if sp["chars"]), None)
+            if sp0 is None:
+                continue
+            c0 = next((c for c in sp0["chars"] if not c["c"].isspace()), None)
+            if c0 is None or not c0["c"].isupper() or c0["bbox"][0] > bx0 + 4 \
+                    or c0["bbox"][3] - c0["bbox"][1] < med * 1.7:
+                continue
+            first = lines[0]
+            fsp = next((sp for sp in first["spans"] if sp["chars"]), None)
+            if fsp is None or not fsp["chars"][0]["c"].islower():
+                continue
+            sp0["chars"].remove(c0)
+            h = fsp["chars"][0]
+            w = (h["bbox"][2] - h["bbox"][0]) * 1.2
+            c0 = dict(c0, bbox=(h["bbox"][0] - w, h["bbox"][1], h["bbox"][0], h["bbox"][3]),
+                      origin=(h["bbox"][0] - w, h["origin"][1]))
+            fsp["chars"].insert(0, c0)
+            break
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            boxes = [c["bbox"] for sp in l["spans"] for c in sp["chars"] if not c["c"].isspace()]
+            if boxes:
+                hs = sorted(bb[3] - bb[1] for bb in boxes)
+                hmed = hs[len(hs) // 2]
+                core = [bb for bb in boxes if bb[3] - bb[1] <= hmed * 1.5] or boxes
+                l["bbox"] = (min(bb[0] for bb in boxes), min(bb[1] for bb in core),
+                             max(bb[2] for bb in boxes), max(bb[3] for bb in core))
+
+
+def _norm_tok(t: str) -> str:
+    return t.lower().rstrip(".,;:")
+
+
+def _pick_token(o: str, l: str, freq: dict[str, int]) -> str:
+    """같은 자리의 OCR 단어(o)와 원래 글자층 단어(l) 중 믿을 만한 쪽.
+    글자층: 줄 끝이 잘림('buildin'), %를 '0/6'으로 읽음. tesseract: 위첨자를 '?'로, n을 1로 읽음."""
+    no, nl = _norm_tok(o), _norm_tok(l)
+    if no == nl:
+        return l                                   # 대소문자는 글자층이 더 정확 ('Strategies')
+    if "%" in o and "%" not in l:
+        return o
+    if nl and no.startswith(nl):
+        return o                                   # 글자층이 잘린 단어
+    if re.search(r"[?>]", o) and not re.search(r"[?>]", l) and l[:1].isalnum():
+        return l                                   # 위첨자 a, b를 ?로 읽은 경우
+    os_, ls_ = o.lstrip("“”\"'>?"), l.lstrip("“”\"'")
+    if len(ls_) > 3 and ls_[0].islower() and ls_[1:] == os_ and ls_[1:2].isupper():
+        return ls_                                 # 앞 위첨자 a를 '“'로 읽은 경우 → 'aRepresentations'
+    if freq.get(nl, 0) > freq.get(no, 0):
+        return l                                   # 'Obio' → 'Ohio', '(1' → '(n'
+
+    return o
+
+
+def _align_with_layer(raw: dict, layer_words: list) -> None:
+    """줄마다 원래 글자층의 같은 높이 단어들과 맞대어, 한 단어씩 어긋난 곳을 고친다."""
+    import difflib
+    from collections import Counter
+
+    freq: Counter = Counter(_norm_tok(w[4]) for w in layer_words)
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                t = "".join(c["c"] for c in sp["chars"]).strip()
+                if t:
+                    freq[_norm_tok(t)] += 1
+    # 같은 높이의 OCR 줄(표에서는 칸마다 따로 잡힘)을 한 행으로 묶어 글자층의 같은 행과 맞댄다
+    rows: list[list[dict]] = []
+    for l in sorted((l for b in raw["blocks"] for l in b.get("lines", [])),
+                    key=lambda l: (l["bbox"][1] + l["bbox"][3]) / 2):
+        yc = (l["bbox"][1] + l["bbox"][3]) / 2
+        if rows and abs(yc - rows[-1][0]["_yc"]) <= (l["bbox"][3] - l["bbox"][1]) * 0.4:
+            l["_yc"] = rows[-1][0]["_yc"]
+            rows[-1].append(l)
+        else:
+            l["_yc"] = yc
+            rows.append([l])
+    for row in rows:
+        row.sort(key=lambda l: l["bbox"][0])
+        y0 = min(l["bbox"][1] for l in row)
+        y1 = max(l["bbox"][3] for l in row)
+        x0 = min(l["bbox"][0] for l in row)
+        x1 = max(l["bbox"][2] for l in row)
+        spans = [sp for l in row for sp in l["spans"] if "".join(c["c"] for c in sp["chars"]).strip()]
+        if True:
+            if not spans:
+                continue
+            lw = [w for w in layer_words
+                  if y0 - 2 <= (w[1] + w[3]) / 2 <= y1 + 2 and w[2] > x0 - 30 and w[0] < x1 + 60]
+            if not lw:
+                continue
+            # 글자층 단어도 줄(높이)별로 묶은 뒤 왼쪽→오른쪽
+            lw.sort(key=lambda w: (w[1] + w[3]) / 2)
+            lrows: list[list] = []
+            for w in lw:
+                if lrows and abs((w[1] + w[3]) / 2 - (lrows[-1][0][1] + lrows[-1][0][3]) / 2) <= (w[3] - w[1]) * 0.4:
+                    lrows[-1].append(w)
+                else:
+                    lrows.append([w])
+            lw = [w for r in lrows for w in sorted(r, key=lambda w: w[0])]
+            ot = ["".join(c["c"] for c in sp["chars"]).strip() for sp in spans]
+            lt = [w[4] for w in lw]
+            sm = difflib.SequenceMatcher(a=[_norm_tok(t) for t in ot], b=[_norm_tok(t) for t in lt],
+                                         autojunk=False)
+            for op, a0, a1, b0, b1 in sm.get_opcodes():
+                pairs = []
+                if op == "equal":
+                    pairs = list(zip(range(a0, a1), range(b0, b1)))
+                elif op == "replace" and a1 - a0 == b1 - b0:
+                    pairs = list(zip(range(a0, a1), range(b0, b1)))
+                for ai, bi in pairs:
+                    new = _pick_token(ot[ai], lt[bi], freq)
+                    if new != ot[ai]:
+                        _set_span_text(spans[ai], new)
+
+
+def _set_span_text(sp: dict, text: str) -> None:
+    ch = [c for c in sp["chars"] if c["c"].strip()]
+    if not ch:
+        return
+    lead = [c for c in sp["chars"][: sp["chars"].index(ch[0])]]
+    x0, y0, _, y1 = ch[0]["bbox"]
+    x1 = ch[-1]["bbox"][2]
+    w = (x1 - x0) / max(1, len(text))
+    out = []
+    for i, c in enumerate(text):
+        d = dict(ch[min(i, len(ch) - 1)])
+        d["c"] = c
+        d["bbox"] = (x0 + w * i, y0, x0 + w * (i + 1), y1)
+        d["origin"] = (x0 + w * i, d["origin"][1])
+        out.append(d)
+    sp["chars"] = lead + out
+
+
+def _mark_bold_by_ink(page: pymupdf.Page, raw: dict) -> None:
+    """OCR 글자에는 글꼴 정보가 없다 → 획 굵기(가로 방향 검은 픽셀 연속 길이)로 굵은 글씨를 찾는다.
+    비슷한 높이의 단어들보다 1.4배 이상 굵으면 bold (표의 굵은 수치, 제목)."""
+    import numpy as np
+
+    dpi = 200
+    k = dpi / 72
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    a = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, : pix.width] < 128
+    items = []
+    for b in raw["blocks"]:
+        for l in b.get("lines", []):
+            for sp in l["spans"]:
+                t = "".join(c["c"] for c in sp["chars"]).strip()
+                if len(t) < 2:
+                    continue
+                x0, y0, x1, y1 = [int(v * k) for v in sp["bbox"]]
+                crop = a[max(0, y0):y1, max(0, x0):x1]
+                if crop.size == 0:
+                    continue
+                d = np.diff(np.pad(crop.astype(np.int8), ((0, 0), (1, 1))), axis=1)
+                runs = (np.nonzero(d == -1)[1] - np.nonzero(d == 1)[1])
+                if len(runs) < 8:
+                    continue
+                digit = sum(ch.isdigit() for ch in t) * 2 >= len(t)
+                items.append((sp, sp["bbox"][3] - sp["bbox"][1], float(runs.mean()), digit))
+    if len(items) < 10:
+        return
+    allw = [w for _, _, w, _ in items]
+    for sp, h, w, dg in items:
+        # 숫자는 획이 가늘어 글자와 따로 비교한다
+        sim = [w2 for _, h2, w2, d2 in items if abs(h2 - h) <= h * 0.25 and d2 == dg]
+        ref = statistics.median(sim) if len(sim) >= 5 else statistics.median(allw)
+        if w >= ref * 1.4:
+            sp["flags"] |= 16
+
+
 def is_scanned(page: pymupdf.Page, raw: dict) -> bool:
     """글자는 거의 없고 큰 이미지가 쪽을 덮고 있으면 스캔 쪽.
     (스캔본에 OCR 글자층이 있어도 글자가 엉망인 경우가 많아, 글자층이 빈약하면 스캔으로 본다)"""
@@ -499,7 +784,56 @@ def is_scanned(page: pymupdf.Page, raw: dict) -> bool:
     return chars < 200 and img_area > area * 0.5
 
 
-def extract_page(page: pymupdf.Page) -> dict[str, Any]:
+FOOTER_BAND = 70
+_ROT_DOCS: dict[str, pymupdf.Document] = {}
+
+
+def _word_quality(raw: dict) -> float:
+    """OCR 결과가 실제 영어 단어처럼 보이는 비율 (돌아간 쪽을 읽으면 기호 범벅이 된다)."""
+    words = re.findall(r"\S+", " ".join("".join(c["c"] for c in sp["chars"])
+                                         for b in raw["blocks"] for l in b.get("lines", []) for sp in l["spans"]))
+    if not words:
+        return 0.0
+    good = sum(1 for w in words if re.fullmatch(r"[(\"“]?[A-Za-z][a-z]+[.,;:)\"”]?|\d+%?|\(\d+\)", w))
+    return good / len(words)
+
+
+def _extract_rotated_scan(page: pymupdf.Page) -> dict[str, Any] | None:
+    """스캔 쪽을 90°/270° 돌린 이미지로 다시 읽어, 더 그럴듯한 방향을 고른다.
+    결과는 돌린 좌표계의 블록이며, 조판할 때 가로 쪽에 짠 뒤 다시 돌려 붙인다(render_page)."""
+    W, H = page.rect.width, page.rect.height
+    best = None
+    for rot in (90, 270):
+        tmp = pymupdf.open()
+        tp = tmp.new_page(width=H, height=W)
+        # 아래쪽 다운로드 안내 띠는 돌리면 세로 글자 쓰레기가 되므로 빼고 돌린다
+        tp.show_pdf_page(tp.rect, page.parent, page.number, rotate=rot,
+                         clip=pymupdf.Rect(0, 0, W, H - FOOTER_BAND))
+        pix = tp.get_pixmap(dpi=300)
+        img = pymupdf.open()
+        ip = img.new_page(width=H, height=W)
+        ip.insert_image(ip.rect, pixmap=pix)
+        try:
+            raw = _reocr_raw(ip, ip.get_text("rawdict"))
+        except Exception:
+            raw = None
+        q = _word_quality(raw) if raw else 0.0
+        if q >= 0.6 and (best is None or q > best[0]):
+            best = (q, rot, img)
+    if best is None:
+        return None
+    q, rot, img = best
+    pg = extract_page(img[0], _in_rotated=True)
+    if pg.get("mode") != "text":
+        return None
+    pg["rotated"] = rot
+    key = f"rot{len(_ROT_DOCS)}_{id(img)}"
+    _ROT_DOCS[key] = img                     # 문서 객체는 복사(deepcopy)할 수 없어 따로 보관
+    pg["_rot_key"] = key
+    return pg
+
+
+def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any]:
     """원문 페이지 1장 → {"mode", "body_size", "blocks"}.
 
     mode = "text"  : 일반 페이지 (블록 단위로 번역)
@@ -507,6 +841,16 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
            "scan"  : 글자가 사진으로 된 스캔 쪽 → OCR(build_ocr_page) 후 "text"가 된다
     """
     raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES)
+    if _in_rotated:
+        raw = _reocr_raw(page, raw) or raw
+    elif _page_is_image_backed(page) and not is_scanned(page, raw):
+        new = _reocr_raw(page, raw)
+        if new is not None and _word_quality(new) < 0.5:
+            # 가로로 돌려 인쇄한 스캔 표: 돌려서 다시 읽어 본다
+            rot = _extract_rotated_scan(page)
+            if rot is not None:
+                return rot
+        raw = new or raw
     body = body_size_of(raw)
     H = page.rect.height
     if is_scanned(page, raw):
@@ -522,9 +866,6 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         return {"mode": "text", "body_size": table["size"], "blocks": [table]}
 
     figs = _figure_regions(page, raw)
-    blocks: list[dict[str, Any]] = [
-        {"kind": "figure", "bbox": r, "size": body, "html": "", "text": ""} for r in figs
-    ]
 
     # 줄 단위로 먼저 읽는다 (선 없는 표를 찾으려면 블록을 가로질러 줄을 봐야 함)
     block_lines: list[tuple[pymupdf.Rect, list[dict]]] = []
@@ -540,6 +881,9 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
             x["id"] = id(x)
         if lines:
             block_lines.append((pymupdf.Rect(b["bbox"]), lines))
+
+    figs = _grow_figures(figs, block_lines, page.rect)
+    blocks: list[dict[str, Any]] = [_figure_block(r, block_lines, body) for r in figs]
 
     def in_fig(r: pymupdf.Rect) -> bool:
         c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
@@ -633,10 +977,190 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         elif b["kind"] == "para" and b["size"] < body * 0.85:
             b["kind"] = "note"
 
+    _fix_kinds(blocks, page.rect, body)
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
     _carry_across_columns(ordered, page.rect)
-    return {"mode": "text", "body_size": body, "blocks": _merge_headings(ordered)}
+    ordered = _merge_caption_tail(_merge_headings(ordered))
+    return {"mode": "text", "body_size": body, "blocks": _split_byline(ordered, page.rect)}
+
+
+TITLE_CASE_SMALL = {"a", "an", "the", "of", "and", "or", "in", "on", "for", "to", "by", "with", "from", "at", "as"}
+
+
+def _is_title_case(t: str) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z'’-]*", t)
+    return bool(words) and words[0][0].isupper() and \
+        all(w[0].isupper() or w.lower() in TITLE_CASE_SMALL for w in words)
+
+
+NUMERIC_LABEL_RE = re.compile(r"^[\d\s.,%()=<>+\-–—/:*n]*$")
+
+
+def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupdf.Rect) -> list[pymupdf.Rect]:
+    """그림 가장자리에 붙은 짧은 글자(축 눈금 '100%', 막대 위 '82%(n=37)', 범주명)가 그림 밖으로
+    빠지지 않게 그림 영역을 넓힌다. 캡션·쪽 머리글 띠·긴 본문은 넣지 않는다."""
+    H = page_rect.height
+    figs = [pymupdf.Rect(f) for f in figs]
+    changed = True
+    while changed:
+        changed = False
+        for bbox, lines in block_lines:
+            text = " ".join(l["text"].strip() for l in lines)
+            if len(text) > 45 or CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) \
+                    or bbox.y1 < 62 or bbox.y0 > H - 70:
+                continue
+            for f in figs:
+                if f.contains(bbox):
+                    break
+                near = pymupdf.Rect(f.x0 - 8, f.y0 - 8, f.x1 + 8, f.y1 + 8)
+                xov = min(bbox.x1, f.x1) - max(bbox.x0, f.x0)
+                if near.intersects(bbox) and xov >= bbox.width * 0.6:
+                    f |= bbox
+                    changed = True
+                    break
+    return figs
+
+
+def _figure_block(r: pymupdf.Rect, block_lines: list, body: float) -> dict[str, Any]:
+    """그림 블록. 그림 안의 글자(범주명·범례·도식 상자 글자)는 묶어서 번역 대상으로 둔다
+    (그림은 원본 그대로 두고, 같은 쪽에 '원문 → 번역' 대응표로 보여 준다). 숫자·눈금은 제외."""
+    lines = [l for _, ls in block_lines for l in ls
+             if r.contains(pymupdf.Point((l["bbox"].x0 + l["bbox"].x1) / 2, (l["bbox"].y0 + l["bbox"].y1) / 2))
+             and not CAPTION_RE.match(l["text"].strip())]
+    lines.sort(key=lambda l: (l["bbox"].y0, l["bbox"].x0))
+    groups: list[list[dict]] = []
+    for l in lines:
+        for g in groups:
+            last = g[-1]["bbox"]
+            xov = min(l["bbox"].x1, last.x1) - max(l["bbox"].x0, last.x0)
+            if 0 <= l["bbox"].y0 - last.y1 <= l["bbox"].height * 0.8 and xov > 0:
+                g.append(l)
+                break
+        else:
+            groups.append([l])
+    items, boxes = [], []
+    for g in groups:
+        text = " ".join(l["text"].strip() for l in g)
+        if NUMERIC_LABEL_RE.match(text) or len(re.findall(r"[A-Za-z]", text)) < 2:
+            continue
+        html, _ = join_lines(g)
+        items.append(_protect(html))
+        bb = pymupdf.Rect(g[0]["bbox"])
+        for l in g[1:]:
+            bb |= l["bbox"]
+        boxes.append(bb)
+    return {"kind": "figure", "bbox": r, "size": body, "html": "", "text": "\n".join(c for c in items),
+            "items": items, "item_boxes": boxes}
+
+
+def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None:
+    """글꼴 정보가 없거나 OCR로 블록이 잘게 나뉜 쪽에서 종류를 바로잡는다.
+    - 쪽 위 머리글 구역에 걸린 '본문 폭의 줄'이 바로 아래 문단과 붙어 있으면 본문 (쪽 첫 줄)
+    - 위아래가 비어 있는 짧은 Title Case 한 줄('Conceptual Framework')은 소제목"""
+    W = page_rect.width
+    figs = [b["bbox"] for b in blocks if b["kind"] in ("figure", "table")]
+    for b in blocks:
+        if b["kind"] in ("para", "note", "heading") and CAPTION_RE.match(b["text"]) and any(
+                -4 <= b["bbox"].y0 - f.y1 <= 20 or -4 <= f.y0 - b["bbox"].y1 <= 20 for f in figs):
+            b["kind"] = "caption"
+    texty = [b for b in blocks if b["kind"] not in ("figure", "table")]
+    for b in texty:
+        r = b["bbox"]
+        below = [o for o in texty if o is not b and -2 <= o["bbox"].y0 - r.y1 <= b["size"] * 0.9
+                 and min(o["bbox"].x1, r.x1) - max(o["bbox"].x0, r.x0) > r.width * 0.5]
+        above = [o for o in texty if o is not b and -2 <= r.y0 - o["bbox"].y1 <= b["size"] * 0.9
+                 and min(o["bbox"].x1, r.x1) - max(o["bbox"].x0, r.x0) > r.width * 0.5]
+        if b["kind"] == "header" and r.y1 < page_rect.height * 0.3 and r.width > W * 0.6 and below \
+                and not DOWNLOAD_NOTICE_RE.search(b["text"]):
+            b["kind"] = "para"
+        elif b["kind"] in ("para", "note") and len(b.get("lines", [])) == 1 and len(b["text"]) < 70 \
+                and not SENTENCE_END_RE.search(b["text"]) and _is_title_case(b["text"]) \
+                and not below and not above and b["size"] >= body * 0.8:
+            b["kind"] = "heading"
+    # 한 단 쪽에서 좌우가 함께 들여 쓴 여러 줄 문단 = 긴 인용문
+    paras = [b for b in blocks if b["kind"] == "para" and len(b.get("lines", [])) >= 3]
+    if paras and sum(b["bbox"].width > W * 0.6 for b in paras) >= len(paras) * 0.6:
+        L = statistics.median(b["bbox"].x0 for b in paras)
+        R = statistics.median(b["bbox"].x1 for b in paras)
+        for b in blocks:
+            if b["kind"] == "para" and len(b.get("lines", [])) >= 2 and b["bbox"].x0 > L + 12 \
+                    and b["bbox"].x1 < R - 12 and not b.get("centered"):
+                b["quote"] = True
+
+
+def _merge_caption_tail(blocks: list[dict]) -> list[dict]:
+    """두 줄 표 제목의 둘째 줄('to Implementation')이 따로 잡혔으면 캡션에 붙인다."""
+    out: list[dict] = []
+    for b in blocks:
+        prev = out[-1] if out else None
+        if prev and prev["kind"] == "caption" and b["kind"] in ("para", "heading", "note") \
+                and len(b["text"]) < 90 and b.get("centered") \
+                and -2 <= b["bbox"].y0 - prev["bbox"].y1 < b["size"] * 0.9:
+            prev["html"] += " " + b["html"]
+            prev["text"] += " " + b["text"]
+            prev["bbox"] |= b["bbox"]
+            prev["lines"] = prev.get("lines", []) + b.get("lines", [])
+            continue
+        out.append(b)
+    return out
+
+
+def _split_byline(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict]:
+    """논문 제목 아래 저자·소속(가운데 정렬 짧은 줄들)은 줄마다 따로 둔다.
+    OCR이 '이름 + 소속'을 한 블록으로 묶으면 번역이 'Ohio University Marjorie …'처럼 엉킨다."""
+    ti = next((i for i, b in enumerate(blocks) if b["kind"] == "heading" and b.get("title")), None)
+    if ti is None:
+        return blocks
+    out = blocks[: ti + 1]
+    i = ti + 1
+    W = page_rect.width
+    t = out[-1]
+    # 제목 마지막 줄('Classrooms')이 따로 잡혔으면 제목에 붙인다
+    while i < len(blocks) and blocks[i]["kind"] in ("para", "heading", "note") \
+            and len(blocks[i].get("lines") or []) == 1 and blocks[i]["size"] >= t["size"] * 0.85 \
+            and -2 <= blocks[i]["bbox"].y0 - t["bbox"].y1 < t["size"] * 1.2:
+        b = blocks[i]
+        t["html"] += " " + b["html"]
+        t["text"] += " " + b["text"]
+        t["bbox"] |= b["bbox"]
+        t["lines"] = t.get("lines", []) + b.get("lines", [])
+        i += 1
+    t = out[-1]
+    # 제목 마지막 줄('Classrooms')이 따로 잡혔으면 제목에 붙인다
+    while i < len(blocks) and blocks[i]["kind"] in ("para", "heading", "note") \
+            and len(blocks[i].get("lines") or []) == 1 and blocks[i]["size"] >= t["size"] * 0.85 \
+            and -2 <= blocks[i]["bbox"].y0 - t["bbox"].y1 < t["size"] * 1.2:
+        b = blocks[i]
+        t["html"] += " " + b["html"]
+        t["text"] += " " + b["text"]
+        t["bbox"] |= b["bbox"]
+        t["lines"] = t.get("lines", []) + b.get("lines", [])
+        i += 1
+    while i < len(blocks):
+        b = blocks[i]
+        cx = (b["bbox"].x0 + b["bbox"].x1) / 2
+        lines = b.get("lines") or []
+        if b["kind"] in ("para", "heading", "note") and lines and abs(cx - W / 2) < 30 \
+                and all(len(l["text"]) < 70 for l in lines) and b["bbox"].width < W * 0.75:
+            for l in lines:
+                t = l["text"].strip()
+                out.append({"kind": "para", "bbox": pymupdf.Rect(l["bbox"]), "size": l["size"],
+                            "html": _protect(l["html"].strip()), "text": t, "lines": [l],
+                            "centered": True, "no_indent": True, "title": False,
+                            "byline": "name" if PERSON_NAME_RE.match(t) and not AFFIL_RE.search(t) else "affil"})
+            i += 1
+            continue
+        break
+    # 저자·소속 바로 다음의 긴 문단 = 초록 (원문에 'Abstract' 제목이 없어도 서식으로만 구분)
+    if i > ti + 1 and i < len(blocks) and blocks[i]["kind"] == "para" and len(blocks[i]["text"]) > 200:
+        blocks[i]["abstract"] = True
+    return out + blocks[i:]
+
+
+PERSON_NAME_RE = re.compile(r"^(?:[A-Z][a-zA-Z'’\-]+\.?|[A-Z]\.)(?:\s+(?:[A-Z][a-zA-Z'’\-]+\.?|[A-Z]\.|de|van|von|da)){1,4}$")
+AFFIL_RE = re.compile(r"Universit|College|Institut|Center|Centre|School|Department|Laboratory|Foundation|"
+                      r"Research|Board|Council|Ministry|Hospital|Corporation|Inc\b", re.I)
 
 
 def _merge_continuations(blocks: list[dict]) -> list[dict]:
@@ -664,8 +1188,9 @@ def _merge_headings(blocks: list[dict]) -> list[dict]:
     out: list[dict] = []
     for b in blocks:
         prev = out[-1] if out else None
-        if (prev and prev["kind"] == b["kind"] == "heading" and abs(prev["size"] - b["size"]) < 0.5
-                and 0 <= b["bbox"].y0 - prev["bbox"].y1 < b["size"] * 1.2):
+        if (prev and prev["kind"] == b["kind"] == "heading"
+                and abs(prev["size"] - b["size"]) < max(0.5, b["size"] * 0.12)
+                and -2 <= b["bbox"].y0 - prev["bbox"].y1 < b["size"] * 1.2):
             prev["html"] += " " + b["html"]
             prev["text"] += " " + b["text"]
             prev["bbox"] |= b["bbox"]
@@ -927,10 +1452,12 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
                 blocks.remove(first)
 
 
-def extract_document(doc: pymupdf.Document) -> list[dict]:
+def extract_document(doc: pymupdf.Document, progress=None) -> list[dict]:
     """문서 전체 추출. 특정 페이지가 실패해도 나머지는 계속한다(mode='error')."""
     pages: list[dict] = []
     for i in range(doc.page_count):
+        if progress:
+            progress(i, doc.page_count)
         try:
             pg = extract_page(doc[i])
         except Exception as e:
@@ -946,8 +1473,9 @@ def extract_document(doc: pymupdf.Document) -> list[dict]:
         rest = [b for b in pages[0]["blocks"] if b["kind"] != "meta"]
         heads = [b for b in rest if b["kind"] == "header"]
         pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
+    _assign_printed_numbers(pages)
     mark_references(pages)
-    carry_cross_page(pages)
+    # 쪽 경계에서 끊긴 문장은 옮기지 않는다: 번역본 n쪽 = 원문 n쪽 내용 (원문 대조가 우선)
     _repeat_table_headers(pages)
     return pages
 
@@ -977,7 +1505,11 @@ def translatable_units(pg: dict, translate_refs: bool = False,
     units: list[tuple[int, int | None, str]] = []
     for bi, b in enumerate(pg["blocks"]):
         k = b["kind"]
-        if k in ("header", "figure", "meta"):
+        if k == "figure":
+            if translate_captions:
+                units += [(bi, ii, h) for ii, h in enumerate(b.get("items") or [])]
+            continue
+        if k in ("header", "meta"):
             continue
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
@@ -999,45 +1531,63 @@ def apply_translations(pg: dict, units: list[tuple[int, int | None, str]], resul
 
 
 # ─────────────────────── 5. 번역 페이지 조판 ───────────────────────
-def make_css(lh: float = 1.32) -> str:
-    return _CSS_TEMPLATE.replace("{LH}", f"{lh:.2f}").replace("{LH_SMALL}", f"{max(1.15, lh - 0.1):.2f}")
+def make_css(lh: float = 1.32, compact: bool = False) -> str:
+    css = _CSS_TEMPLATE.replace("{LH}", f"{lh:.2f}").replace("{LH_SMALL}", f"{max(1.15, lh - 0.1):.2f}")
+    return css + (COMPACT_CSS if compact else "")
 
 
 _CSS_TEMPLATE = f"""
 @font-face {{ font-family: kr; src: url({FONT_REGULAR}); }}
 @font-face {{ font-family: kr; src: url({FONT_BOLD}); font-weight: bold; }}
 * {{ font-family: kr; }}
-body {{ color: #1a1a1a; }}
-p {{ margin: 0 0 0.4em 0; line-height: {{LH}}; text-align: left; }}
+body {{ color: #111; }}
+p {{ margin: 0 0 0.22em 0; line-height: {{LH}}; text-align: left; }}
 p.para {{ text-indent: 1em; }}
 p.center {{ text-align: center; }}
-h1 {{ font-size: 1.5em; font-weight: bold; text-align: center; line-height: 1.35; margin: 0.4em 0 0.8em 0; }}
-h2 {{ font-size: 1.05em; font-weight: bold; text-align: center; margin: 0.6em 0 0.5em 0; }}
-h3 {{ font-size: 1.0em; font-weight: bold; margin: 0.6em 0 0.35em 0; }}
-ul {{ margin: 0.1em 0 0.5em 1.6em; padding: 0; }}
-li {{ line-height: {{LH}}; margin-bottom: 0.15em; }}
+p.byline {{ text-align: center; font-size: 0.9em; line-height: 1.3; margin: 0; }}
+p.byname {{ text-align: center; font-size: 0.95em; font-weight: bold; line-height: 1.3; margin: 0.35em 0 0 0; }}
+p.abstract {{ font-size: 0.95em; margin: 0.9em 1.6em 0.9em 1.6em; text-indent: 0; }}
+p.quote {{ margin: 0.3em 1.6em 0.4em 1.6em; text-indent: 0; }}
+h1 {{ font-size: 1.4em; font-weight: bold; text-align: center; line-height: 1.32; margin: 0.2em 0 0.7em 0; }}
+h2 {{ font-size: 1.12em; font-weight: bold; text-align: center; line-height: 1.3; margin: 0.95em 0 0.35em 0; }}
+h3 {{ font-size: 1.02em; font-weight: bold; line-height: 1.3; margin: 0.75em 0 0.25em 0; }}
+ul {{ margin: 0.1em 0 0.4em 1.4em; padding: 0; }}
+li {{ line-height: {{LH}}; margin-bottom: 0.12em; }}
 b {{ font-weight: bold; }}
 sup {{ font-size: 0.7em; }}
-.cap {{ font-size: 0.85em; text-align: center; margin: 0.2em 0 0.7em 0; }}
-.fig {{ text-align: center; margin: 0.3em 0 0.2em 0; }}
-.dlg {{ line-height: {{LH}}; margin: 0 1.2em 0.2em 1.2em; padding-left: 1.2em; text-indent: -1.2em; }}
-.meta {{ font-size: 0.75em; color: #666; line-height: 1.35; margin: 0 0 0.6em 0; }}
-.note {{ font-size: 0.85em; line-height: {{LH_SMALL}}; margin: 0 0 0.25em 1.5em; }}
-.fn {{ font-size: 0.8em; line-height: {{LH_SMALL}}; color: #333; }}
-.ref {{ font-size: 0.8em; line-height: 1.4; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
-.tcap {{ text-align: center; font-size: 1.0em; margin: 0 0 0.6em 0; line-height: 1.35; }}
+.cap {{ font-size: 0.9em; text-align: left; line-height: 1.38; margin: 0.25em 0 0.8em 0; }}
+.fig {{ text-align: center; margin: 0.5em 0 0.15em 0; }}
+table.figlab {{ border-collapse: collapse; margin: 0.1em 0 0.5em 0; }}
+table.figlab td {{ font-size: 0.78em; line-height: 1.25; padding: 0.05em 0.4em; vertical-align: top;
+                   border-bottom: 0.4px solid #bbb; }}
+table.figlab td.src {{ color: #333; }}
+.dlg {{ line-height: {{LH}}; margin: 0 0.6em 0.22em 0.6em; padding-left: 1.4em; text-indent: -1.4em; }}
+.meta {{ font-size: 0.75em; color: #444; line-height: 1.35; margin: 0 0 0.6em 0; }}
+.note {{ font-size: 0.9em; line-height: {{LH_SMALL}}; margin: 0 0 0.22em 1.2em; }}
+.fn {{ font-size: 0.85em; line-height: {{LH_SMALL}}; color: #111; margin: 0 0 0.15em 0; }}
+.ref {{ font-size: 0.85em; line-height: 1.38; margin: 0 0 0.3em 1.6em; text-indent: -1.6em; }}
+.tcap {{ text-align: left; font-size: 0.95em; margin: 0.6em 0 0.35em 0; line-height: 1.35; }}
 table.tbl {{ border-collapse: collapse; }}
-table.first {{ border-top: 0.8px solid #333; }}
-th {{ font-size: 0.85em; font-weight: bold; text-align: left; vertical-align: bottom;
-      padding: 0.1em 0.3em; border-bottom: 0.6px solid #333; line-height: 1.22; }}
-th.sup {{ text-align: center; }}
-td {{ font-size: 0.85em; vertical-align: top; padding: 0.05em 0.3em; line-height: 1.22; }}
+table.first {{ border-top: 0.9px solid #000; }}
+th {{ font-size: 0.86em; font-weight: bold; text-align: left; vertical-align: bottom; background-color: #eeeeee;
+      padding: 0.15em 0.3em; border-bottom: 0.7px solid #000; line-height: 1.22; }}
+th.sup {{ text-align: center; border-bottom: 0.4px solid #666; }}
+td {{ font-size: 0.86em; vertical-align: top; padding: 0.08em 0.3em; line-height: 1.24; }}
+td.num {{ text-align: center; }}
+td.rowh {{ font-weight: normal; }}
+table.last {{ border-bottom: 0.9px solid #000; }}
 p.ti {{ margin: 0 0 0.1em 0; padding-left: 0.8em; text-indent: -0.8em; text-align: left; line-height: 1.22; }}
-p.tp {{ margin: 0; text-align: left; line-height: 1.22; }}
-.tnote {{ font-size: 0.8em; margin-top: 0.5em; border-top: 0.8px solid #333; padding-top: 0.3em; }}
+p.tp {{ margin: 0; text-align: inherit; line-height: 1.22; }}
+.tnote {{ font-size: 0.82em; margin-top: 0.3em; padding-top: 0.2em; }}
 u {{ text-decoration: underline; }}
 i {{ font-style: italic; }}
-hr {{ border: none; border-top: 0.5px solid #999; width: 30%; margin: 0.6em 0 0.4em 0; }}
+hr {{ border: none; border-top: 0.5px solid #666; width: 30%; margin: 0.6em 0 0.35em 0; }}
+"""
+
+COMPACT_CSS = """
+p { margin-bottom: 0.08em; } h1 { margin: 0 0 0.4em 0; } h2 { margin: 0.5em 0 0.2em 0; }
+h3 { margin: 0.4em 0 0.15em 0; } .cap { margin: 0.1em 0 0.4em 0; } .tcap { margin: 0.3em 0 0.2em 0; }
+p.abstract { margin: 0.5em 1.2em 0.5em 1.2em; } .fig { margin: 0.2em 0 0.1em 0; } hr { margin: 0.3em 0 0.2em 0; }
 """
 CSS = make_css(LINE_HEIGHT)
 
@@ -1054,7 +1604,7 @@ def to_reading_html(tr_html: str, italic_to_bold: bool = True) -> str:
 def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
     """번역된 블록 → HTML 조각 목록. 각주는 맨 끝에 구분선과 함께."""
     out: list[str] = []
-    for b in blocks:
+    for bi, b in enumerate(blocks):
         k = b["kind"]
         if k in ("header", "footnote"):
             continue
@@ -1069,12 +1619,20 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             cls = "" if b.get("no_indent") else "para"
             if b.get("centered"):
                 cls = "center"
+            if b.get("byline"):
+                cls = "byname" if b["byline"] == "name" else "byline"
+            elif b.get("abstract"):
+                cls = "abstract"
+            elif b.get("quote"):
+                cls = "quote"
             out.append(f'<p class="{cls}">{to_reading_html(tr)}</p>')
         elif k == "list":
             items = b.get("tr_items") or b["items"]
             out.append("<ul>" + "".join(f"<li>{to_reading_html(t)}</li>" for t in items) + "</ul>")
         elif k == "caption":
-            out.append(f'<p class="cap">{to_reading_html(tr)}</p>')
+            nxt = blocks[bi + 1]["kind"] if bi + 1 < len(blocks) else ""
+            cls = "tcap" if nxt == "table" or b["text"].lstrip().upper().startswith("TABLE") else "cap"
+            out.append(f'<p class="{cls}">{to_reading_html(tr)}</p>')
         elif k == "note":
             out.append(f'<p class="note">{to_reading_html(tr)}</p>')
         elif k == "table":
@@ -1092,6 +1650,11 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
             if w > box_width - 4:                       # 단 폭보다 넓으면 비율 유지하며 줄인다
                 h, w = h * (box_width - 4) / w, box_width - 4
             out.append(f'<p class="fig"><img src="{b["img_name"]}" width="{w:.0f}" height="{h:.0f}"/></p>')
+            if b.get("tr_items") and b.get("items"):
+                # 그림 속 문구: 원문 | 번역 (그림은 원본 그대로 두어 글자·수치를 가리지 않는다)
+                rows = "".join(f'<tr><td class="src">{esc(plain(o))}</td><td>{to_reading_html(t)}</td></tr>'
+                               for o, t in zip(b["items"], b["tr_items"]))
+                out.append(f'<table class="figlab">{rows}</table>')
     foot = [b for b in blocks if b["kind"] == "footnote"]
     if foot:
         out.append("<hr/>" + "".join(
@@ -1101,6 +1664,35 @@ def _pieces(blocks: list[dict], box_width: float = 360.0) -> list[str]:
 
 def _label_html(text: str) -> str:
     return f'<p style="text-align:right;color:#888;font-size:8pt;margin:0">{esc(text)}</p>'
+
+
+def _page_number_candidates(blocks: list[dict]) -> list[int]:
+    """머리글·꼬리글에서 인쇄 쪽수 후보. 다운로드 안내(날짜·IP), 권호·연도 줄은 제외."""
+    out: list[int] = []
+    for b in blocks:
+        if b["kind"] not in ("header", "meta") or DOWNLOAD_NOTICE_RE.search(b["text"]):
+            continue
+        if re.search(r"\b(Vol|No|pp|Volume|Issue)\b\.?", b["text"]):
+            continue
+        for m in re.finditer(r"(?<![\d.,:/-])(\d{1,4})(?![\d.,:/%-])", b["text"]):
+            n = int(m.group(1))
+            if not 1800 <= n <= 2100:                     # 연도 제외
+                out.append(n)
+    return out
+
+
+def _assign_printed_numbers(pages: list[dict]) -> None:
+    """인쇄 쪽수 = PDF 쪽 번호 + 일정한 차이. 여러 쪽에서 같은 차이로 확인된 경우에만,
+    그 쪽에서 실제로 읽힌 숫자가 차이와 맞을 때 표시한다 (날짜·표 숫자를 쪽수로 쓰지 않는다)."""
+    from collections import Counter
+
+    cands = {pg["page_number"]: _page_number_candidates(pg.get("blocks", [])) for pg in pages}
+    offsets = Counter(n - pno for pno, ns in cands.items() for n in set(ns))
+    best = offsets.most_common(1)
+    ok = best and best[0][1] >= max(2, sum(1 for ns in cands.values() if ns) * 0.4)
+    for pg in pages:
+        pno = pg["page_number"]
+        pg["printed"] = str(pno + best[0][0]) if ok and (pno + best[0][0]) in cands[pno] else None
 
 
 def printed_page_number(blocks: list[dict]) -> str | None:
@@ -1122,8 +1714,24 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
     src = src_doc[pno - 1]
     W, H = src.rect.width, src.rect.height
     archive = pymupdf.Archive(str(FONT_DIR))
-    printed = printed_page_number(pg["blocks"])
+    printed = pg["printed"] if "printed" in pg else printed_page_number(pg["blocks"])
     label = f"PDF p.{pno}" + (f" · 인쇄 {printed}쪽" if printed else "")
+
+    if pg.get("rotated") and pg.get("_rot_key") not in _ROT_DOCS and not note:
+        note = "가로 표 — 원문 분석 정보가 없어 원문 그대로 (PDF를 다시 올려 주세요)"
+    # 가로로 돌려 인쇄한 스캔 표: 돌린 원문(가로 쪽)에 맞춰 짠 뒤, 원래 방향으로 돌려 붙인다
+    if pg.get("rotated") and pg.get("_rot_key") in _ROT_DOCS and pg["mode"] == "text" and not note:
+        inner = {k: v for k, v in pg.items() if k not in ("rotated", "_rot_key")}
+        inner["page_number"] = 1
+        inner["_nolabel"] = True
+        tmp = pymupdf.open()
+        render_page(tmp, _ROT_DOCS[pg["_rot_key"]], inner)
+        pg["_render"] = inner.get("_render")
+        page = out.new_page(width=W, height=H)
+        page.show_pdf_page(pymupdf.Rect(0, 0, W, H), tmp, 0, rotate=-pg["rotated"])
+        page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50), _label_html(label + " · 가로 표"),
+                            css=CSS, archive=archive)
+        return 1
 
     # 회전된 표 페이지, 실패/미번역 페이지 → 원문 페이지를 그대로 (벡터 유지)
     if pg["mode"] != "text" or note:
@@ -1149,7 +1757,10 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
     if not html:
         html = [('<p style="color:#999">(이 페이지에는 번역할 텍스트가 없습니다)</p>', pymupdf.Rect(40, 60, W - 40, 120))]
 
-    font, lh = _fit(html, W, H, archive, pg["body_size"])
+    font, lh, compact = _fit(html, W, H, archive, pg["body_size"])
+    pg["_render"] = {"font": font and round(font, 2), "lh": lh, "compact": compact, "fit": font is not None,
+                     "target_font": round(pg["body_size"] * FONT_BOOST, 2),
+                     "min_font": round(pg["body_size"] * MIN_FONT_RATIO, 2)}
     page = out.new_page(width=W, height=H)
     if font is None:
         # 가장 작은 글자로도 안 들어가는 극단적인 경우: 영역마다 따로 줄여서라도 이 쪽 안에 넣는다
@@ -1157,25 +1768,27 @@ def render_page(out: pymupdf.Document, src_doc: pymupdf.Document, pg: dict,
             page.insert_htmlbox(r, h, css=make_css(1.15) + f"body {{ font-size: {pg['body_size']:.1f}pt; }}",
                                 archive=archive, scale_low=0)
     else:
-        css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
+        css = make_css(lh, compact) + f"body {{ font-size: {font:.2f}pt; }}"
         for h, r in html:
             page.insert_htmlbox(r, h, css=css, archive=archive, scale_low=1)
-    page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50), _label_html(label), css=CSS, archive=archive)
+    if not pg.get("_nolabel"):
+        page.insert_htmlbox(pymupdf.Rect(30, 26, W - 30, 50), _label_html(label), css=CSS, archive=archive)
     return 1
 
 
-LINE_HEIGHTS = (1.6, 1.5, 1.42, 1.34, 1.27, 1.2)   # 넉넉한 것부터 — 글자를 줄이기 전에 줄간격부터 줄인다
+LINE_HEIGHTS = (1.6, 1.52, 1.45, 1.38, 1.32, 1.26, 1.2)
+MIN_FONT_RATIO = 0.62      # 글자 크기 하한 = 원문 본문 크기 × 0.62 (이보다 작아야 하면 '맞추지 못함'으로 기록)   # 넉넉한 것부터 — 글자를 줄이기 전에 줄간격부터 줄인다
 
 
 def _fit(html: list[tuple[str, pymupdf.Rect]], W: float, H: float, archive: pymupdf.Archive,
-         body_size: float) -> tuple[float | None, float]:
-    """쪽 전체에 같은 글자 크기를 쓰면서 모든 영역에 들어가는 (글자 크기, 줄간격)을 찾는다.
-    1) 가장 촘촘한 줄간격으로 들어가는 가장 큰 글자 크기를 찾고 (상한: 원문 본문 × FONT_BOOST)
-    2) 그 글자 크기에서 들어가는 가장 넉넉한 줄간격을 고른다."""
+         body_size: float) -> tuple[float | None, float, bool]:
+    """쪽 전체에 같은 글자 크기를 쓰면서 모든 영역에 들어가는 (글자 크기, 줄간격, 간격 압축 여부).
+    줄이는 순서: ① 줄간격(1.6 → 1.2) ② 문단·제목·캡션 간격(compact) ③ 마지막으로 글자 크기.
+    글자 크기 상한 = 원문 본문 × FONT_BOOST, 하한 = 원문 본문 × MIN_FONT_RATIO (안전장치)."""
     trial = pymupdf.open()
 
-    def fits(font: float, lh: float) -> bool:
-        css = make_css(lh) + f"body {{ font-size: {font:.2f}pt; }}"
+    def fits(font: float, lh: float, compact: bool) -> bool:
+        css = make_css(lh, compact) + f"body {{ font-size: {font:.2f}pt; }}"
         pg_ = trial.new_page(width=W, height=H)
         ok = True
         for h, r in html:
@@ -1187,28 +1800,29 @@ def _fit(html: list[tuple[str, pymupdf.Rect]], W: float, H: float, archive: pymu
         return ok
 
     hi = body_size * FONT_BOOST
-    lo = body_size * 0.55
+    lo = body_size * MIN_FONT_RATIO
     tight = LINE_HEIGHTS[-1]
-    if fits(hi, tight):
-        font = hi
-    elif not fits(lo, tight):
-        trial.close()
-        return None, tight
-    else:
+    try:
+        for compact in (False, True):
+            if fits(hi, tight, compact):
+                for lh in LINE_HEIGHTS:
+                    if lh == tight or fits(hi, lh, compact):
+                        return hi, lh, compact
+        if not fits(lo, tight, True):
+            return None, tight, True
         a, b = lo, hi
         for _ in range(7):
             m = (a + b) / 2
-            if fits(m, tight):
+            if fits(m, tight, True):
                 a = m
             else:
                 b = m
-        font = a
-    for lh in LINE_HEIGHTS:
-        if lh == tight or fits(font, lh):
-            trial.close()
-            return font, lh
-    trial.close()
-    return font, tight
+        for lh in LINE_HEIGHTS:
+            if lh == tight or fits(a, lh, True):
+                return a, lh, True
+        return a, tight, True
+    finally:
+        trial.close()
 
 
 def page_regions(blocks: list[dict], page_rect: pymupdf.Rect) -> list[tuple[pymupdf.Rect, list[dict]]]:
@@ -1271,7 +1885,13 @@ def page_text(pg: dict, translated: bool = True) -> str:
         if k == "header":
             continue
         if k == "figure":
-            parts.append("[그림/표 — 원문 참조]" if translated else "[Figure/Table]")
+            items = (b.get("tr_items") or []) if translated else (b.get("items") or [])
+            head = "[그림 — 원문 참조]" if translated else "[Figure]"
+            if items and translated and b.get("items"):
+                head += " 그림 속 문구: " + " · ".join(f"{plain(o)} → {plain(t)}" for o, t in zip(b["items"], items))
+            elif items:
+                head += " " + " · ".join(plain(t) for t in items)
+            parts.append(head)
         elif k == "list":
             items = (b.get("tr_items") or b["items"]) if translated else b["items"]
             parts.append("\n".join("• " + plain(t) for t in items))
@@ -1451,3 +2071,97 @@ def parse_page_list(text: str, n_pages: int) -> list[int]:
             if 1 <= k <= n_pages:
                 out.add(k)
     return sorted(out)
+
+
+# ─────────────────────── 7. 번역 맥락·구조 기록 ───────────────────────
+FLOW_KINDS = ("para", "list", "dialogue", "note", "heading")
+
+
+def _flow(pg: dict) -> list[dict]:
+    return [b for b in pg.get("blocks", []) if b["kind"] in FLOW_KINDS]
+
+
+def unit_id(pno: int, bi: int, ii: int | None) -> str:
+    return f"p{pno}-b{bi}" + (f"-{ii}" if ii is not None else "")
+
+
+def unit_meta(pages: list[dict], pg: dict, units: list[tuple[int, int | None, str]]) -> list[dict]:
+    """번역 조각마다 식별자·쪽·종류와, 쪽 경계에서 이어지는 문장의 앞뒤 맥락(참고용, 번역 대상 아님)."""
+    pno = pg["page_number"]
+    by_no = {p["page_number"]: p for p in pages}
+    flow = _flow(pg)
+    first_id = id(flow[0]) if flow else None
+    last_id = id(flow[-1]) if flow else None
+    prev_tail = next_head = ""
+    if flow and flow[0]["kind"] == "para":
+        prev = by_no.get(pno - 1)
+        pf = _flow(prev) if prev and prev.get("mode") == "text" else []
+        if pf and pf[-1]["kind"] == "para" and not SENTENCE_END_RE.search(pf[-1]["text"].rstrip()):
+            prev_tail = pf[-1]["text"][-500:]
+    if flow and flow[-1]["kind"] == "para" and not SENTENCE_END_RE.search(flow[-1]["text"].rstrip()):
+        nxt = by_no.get(pno + 1)
+        nf = _flow(nxt) if nxt and nxt.get("mode") == "text" else []
+        if nf and nf[0]["kind"] == "para":
+            next_head = nf[0]["text"][:500]
+    out: list[dict] = []
+    for bi, ii, _ in units:
+        b = pg["blocks"][bi]
+        kind = {"figure": "figure_label", "table": "table_cell", "dialogue": "dialogue_turn",
+                "list": "list_item"}.get(b["kind"], b["kind"])
+        if b.get("title"):
+            kind = "title"
+        m = {"id": unit_id(pno, bi, ii), "page": pno, "type": kind}
+        if id(b) == first_id and prev_tail and ii is None:
+            m["context_before"] = prev_tail
+        if id(b) == last_id and next_head and ii is None:
+            m["context_after"] = next_head
+        out.append(m)
+    return out
+
+
+def structure_record(pages: list[dict], tpages: dict[int, dict | None], reviews: dict[int, list]) -> dict:
+    """재작업용 구조·번역 데이터: 쪽 → 블록(식별자, 종류, 위치, 원문, 번역, 검토)."""
+    doc: dict[str, Any] = {"pages": []}
+    for pg in pages:
+        pno = pg["page_number"]
+        tpg = tpages.get(pno)
+        blocks = []
+        for bi, b in enumerate(pg.get("blocks", [])):
+            tb = tpg["blocks"][bi] if tpg is not None and bi < len(tpg["blocks"]) else {}
+            rec = {"id": unit_id(pno, bi, None), "kind": b["kind"],
+                   "bbox": [round(x, 1) for x in b["bbox"]] if b.get("bbox") is not None else None,
+                   "source": b.get("text", "")}
+            if b.get("items"):
+                rec["source_items"] = [plain(x) for x in b["items"]]
+            if tb.get("tr") is not None:
+                rec["translation"] = plain(tb["tr"])
+            if tb.get("tr_items"):
+                rec["translation_items"] = [plain(x) for x in tb["tr_items"]]
+            if b["kind"] == "header":
+                rec["excluded"] = "머리글·꼬리글·쪽 번호·다운로드 안내 (번역하지 않음)"
+            elif b["kind"] == "reference":
+                rec["excluded"] = "참고문헌 (원문 유지)"
+            blocks.append(rec)
+        doc["pages"].append({"page": pno, "printed": pg.get("printed"), "mode": pg.get("mode"),
+                             "rotated": pg.get("rotated"), "render": (tpg or {}).get("_render"),
+                             "review": reviews.get(pno, []), "blocks": blocks})
+    return doc
+
+
+def bookmarks(tpages: list[dict]) -> list[list]:
+    """PDF 책갈피: 논문 제목(1단계) → 절 제목(2단계). 쪽 수는 늘리지 않는다."""
+    toc: list[list] = []
+    has_title = False
+    for i, pg in enumerate(tpages, start=1):
+        for b in pg.get("blocks", []):
+            if b["kind"] != "heading":
+                continue
+            t = plain(b.get("tr") or b["html"]).strip()
+            if not t:
+                continue
+            if b.get("title") and not has_title:
+                toc.append([1, t[:120], i])
+                has_title = True
+            else:
+                toc.append([2 if has_title else 1, t[:120], i])
+    return toc

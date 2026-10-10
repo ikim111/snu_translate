@@ -6,7 +6,7 @@
        engines.py  번역 엔진 (DeepL / OpenAI)
        library.py  '내 서재' — 번역본을 GitHub 비공개 저장소에 보관
        pdf_core.py PDF 추출·읽기 순서·문단 복원·그림/표·참고문헌·번역 PDF 조판
-       fonts/      번역 PDF에 넣을 한글 글꼴 (나눔고딕, OFL)
+       fonts/      번역 PDF에 넣을 한글 글꼴 (Noto Sans CJK KR, OFL)
 
 번역 PDF는 원문과 같은 판형으로, 원문 1쪽 = 번역 1쪽이 되도록 만든다.
 (내용이 넘치면 글자·줄간격을 줄이고, 그래도 넘치면 '(계속)' 페이지를 붙인다)
@@ -252,8 +252,11 @@ except Exception as e:
 
 paper_id = pdf_hash[:16]
 if st.session_state.get("pdf_hash") != pdf_hash:
-    with st.spinner("PDF 구조 분석 중…"):
-        st.session_state.base_pages = core.extract_document(src)
+    with st.spinner("PDF 구조 분석 중… (스캔본은 쪽 이미지를 다시 읽느라 쪽당 몇 초 걸립니다)"):
+        prog = st.progress(0.0)
+        st.session_state.base_pages = core.extract_document(
+            src, progress=lambda i, n: prog.progress(i / n, text=f"원문 읽는 중… {i} / {n}쪽"))
+        prog.empty()
     st.session_state.pdf_hash = pdf_hash
     st.session_state.pop("built", None)
     st.session_state.pop("pages_ocr_sig", None)
@@ -514,9 +517,17 @@ def make_engine() -> engines.Engine:
     return engines.make_openai(api_key, model, target, glossary_entries)
 
 
-def translate_page(engine: engines.Engine, pg: dict) -> list[str]:
+def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict]) -> tuple[list[str], list[dict]]:
+    """한 쪽 번역. 쪽 경계에서 이어지는 문장은 앞뒤 쪽 원문을 '참고 맥락'으로 함께 보낸다(옮기지는 않음).
+    반환: (번역 목록, 검토가 필요한 조각 [{id, review}])"""
     units = units_of(pg)
-    return engine.translate([h for *_, h in units]) if units else []
+    if not units:
+        return [], []
+    meta = core.unit_meta(all_pages, pg, units)
+    tr = engine.translate([h for *_, h in units], meta)
+    reviews = [{"id": m["id"], "review": m.get("review", "")} for m in meta
+               if m.get("status") == "needs_review" or m.get("review")]
+    return tr, reviews
 
 
 def run_translation(targets: list[dict]) -> None:
@@ -545,14 +556,14 @@ def run_translation(targets: list[dict]) -> None:
     # 페이지 단위로 번역하고, 끝나는 대로 저장한다. OpenAI는 여러 페이지를 동시에 보낸다.
     done = 0
     with ThreadPoolExecutor(max_workers=engine.workers) as pool:
-        futures = {pool.submit(translate_page, engine, pg): pg for pg in targets}
+        futures = {pool.submit(translate_page, engine, pg, pages): pg for pg in targets}
         status.write(f"번역 중… 0 / {len(targets)}쪽")
         for fut in as_completed(futures):
             pg = futures[fut]
             pno = pg["page_number"]
             try:
-                tr = fut.result()
-                cache[str(pno)] = {"tr": tr, "sig": units_sig(pg),
+                tr, reviews = fut.result()
+                cache[str(pno)] = {"tr": tr, "sig": units_sig(pg), "review": reviews,
                                    "pv": engines.PROMPT_VERSION if engine_name == "OpenAI" else "",
                                    "original": core.page_text(pg, translated=False)}
                 save_cache(cache_key, cache)
@@ -658,9 +669,20 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
         orig = core.page_text(pg, translated=False)
         txt.append(f"──────────── Page {pno} ────────────\n\n{body}\n")
         md.append(f"# Page {pno}\n\n## Translation\n\n{body}\n\n## Original\n\n{orig}\n")
+    # 책갈피(절 제목)와 문서 정보. 번역 쪽만 쓴다 (쪽 순서 = 출력 PDF 쪽 순서일 때)
+    if not interleave and all(tpgs.get(pg["page_number"]) is not None for pg in plist):
+        try:
+            out.set_toc(core.bookmarks([tpgs[pg["page_number"]] for pg in plist]))
+        except Exception:
+            pass
+    out.set_metadata({"title": f"{Path(uploaded.name).stem} (한국어 번역)", "creator": "snu_translate",
+                      "producer": "PyMuPDF"})
     out.subset_fonts()
     pdf = out.tobytes(garbage=4, deflate=True)
-    return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8")}
+    reviews = {pg["page_number"]: (cache.get(str(pg["page_number"])) or {}).get("review", []) for pg in plist}
+    record = core.structure_record(plist, tpgs, reviews)
+    return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8"),
+            "json": json.dumps(record, ensure_ascii=False, indent=1).encode("utf-8")}
 
 
 translated_count = sum(1 for pg in sel if has_translation(pg))
@@ -676,11 +698,19 @@ if translated_count:
 
     st.subheader("다운로드")
     stem = f"{Path(uploaded.name).stem[:60]}_번역_p{start}-{end}"
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     d1.download_button("📕 번역 PDF", files["pdf"], file_name=f"{stem}.pdf", mime="application/pdf",
                        type="primary")
     d2.download_button("TXT", files["txt"], file_name=f"{stem}.txt", mime="text/plain")
     d3.download_button("Markdown", files["md"], file_name=f"{stem}.md", mime="text/markdown")
+    d4.download_button("구조·번역 데이터", files["json"], file_name=f"{stem}_구조.json",
+                       mime="application/json", help="쪽별 블록(식별자·위치·원문·번역·검토 기록). 다시 작업할 때 씁니다.")
+    review_rows = [(int(k), r) for k, v in cache.items() if k.isdigit() and isinstance(v, dict)
+                   for r in v.get("review", []) if start <= int(k) <= end]
+    if review_rows:
+        with st.expander(f"⚠️ 검토가 필요한 곳 {len(review_rows)}개 — 원문과 대조해 보세요"):
+            for pno, r in sorted(review_rows, key=lambda x: x[0]):
+                st.markdown(f"- **PDF p.{pno}** `{r['id']}` — {r.get('review') or '번역기가 확인 필요로 표시'}")
 
     def paper_title() -> str:
         for pg in pages[:3]:
