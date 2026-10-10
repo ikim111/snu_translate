@@ -233,6 +233,12 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 - context_before가 있으면 text는 앞 쪽에서 시작한 문장의 뒷부분이고, context_after가 있으면 text의 마지막 문장이 다음 쪽에서 이어진다.
 - 문장 조각을 독립된 완결문으로 오인하지 않는다. 앞뒤 쪽 번역과 이어 읽었을 때 하나의 정확한 문장이 되도록, 이 조각에 해당하는 부분만 옮긴다.
 - 부정 표현이 인접 블록에 있으면 그 적용 범위를 유지한다. "does not … automatically guarantee"를 "자동으로 보장한다"로 옮기지 않는다.
+- 맥락에 있는 내용(다른 쪽에 인쇄된 부분)은 이 조각의 번역에 넣지 않는다. 두 쪽의 번역을 이어 읽으면 한 문장이 되도록,
+  이 조각에 인쇄된 부분만 한국어 어순에 맞게 옮긴다. 같은 내용이 두 쪽에 겹쳐 나오면 안 된다.
+  예) 이 쪽 끝: "Thus, it appears that requesting explanations as part of the task does not"
+      다음 쪽 맥락: "automatically guarantee that student explanations will be produced as the task unfolds."
+      → 이 쪽 번역 끝: "따라서 과제의 일부로 설명을 요구하는 것이"
+      → 다음 쪽 번역 시작: "과제가 진행되는 동안 학생들의 설명이 산출되는 것을 자동으로 보장하지는 않는 것으로 보인다."
 - 현재 조각만으로 의미를 확정할 수 없고 필요한 맥락도 없다면, 추측하지 말고 status를 "needs_review"로 하고 review에 이유를 쓴다.
 - 조각의 id와 페이지 소속을 바꾸지 않는다.
 
@@ -277,7 +283,7 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 입력과 같은 개수, 같은 순서로, 각 결과를 원래 id와 연결한다. translation에 작업 설명, 사과, 검수 의견, 완료 선언을 섞지 않는다."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-11a"
+PROMPT_VERSION = "2026-10-11b"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:
@@ -387,6 +393,12 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 - context_before가 있으면 text는 앞 쪽에서 시작한 문장의 뒷부분이고, context_after가 있으면 text의 마지막 문장이 다음 쪽에서 이어진다.
 - 문장 조각을 독립된 완결문으로 오인하지 않는다. 앞뒤 쪽 번역과 이어 읽었을 때 하나의 정확한 문장이 되도록, 이 조각에 해당하는 부분만 옮긴다.
 - 부정 표현이 인접 블록에 있으면 그 적용 범위를 유지한다. "does not … automatically guarantee"를 "자동으로 보장한다"로 옮기지 않는다.
+- 맥락에 있는 내용(다른 쪽에 인쇄된 부분)은 이 조각의 번역에 넣지 않는다. 두 쪽의 번역을 이어 읽으면 한 문장이 되도록,
+  이 조각에 인쇄된 부분만 한국어 어순에 맞게 옮긴다. 같은 내용이 두 쪽에 겹쳐 나오면 안 된다.
+  예) 이 쪽 끝: "Thus, it appears that requesting explanations as part of the task does not"
+      다음 쪽 맥락: "automatically guarantee that student explanations will be produced as the task unfolds."
+      → 이 쪽 번역 끝: "따라서 과제의 일부로 설명을 요구하는 것이"
+      → 다음 쪽 번역 시작: "과제가 진행되는 동안 학생들의 설명이 산출되는 것을 자동으로 보장하지는 않는 것으로 보인다."
 - 현재 조각만으로 의미를 확정할 수 없고 필요한 맥락도 없다면, 추측하지 말고 status를 "needs_review"로 하고 review에 이유를 쓴다.
 - 조각의 id와 페이지 소속을 바꾸지 않는다.
 
@@ -431,7 +443,7 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 입력과 같은 개수, 같은 순서로, 각 결과를 원래 id와 연결한다. translation에 작업 설명, 사과, 검수 의견, 완료 선언을 섞지 않는다."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-11a"
+PROMPT_VERSION = "2026-10-11b"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:
