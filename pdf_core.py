@@ -56,6 +56,8 @@ SANS_FONTS = ("helvetica", "arial", "frutiger", "univers")  # run-in 소제목�
 PROTECT_RE = re.compile(
     r"(https?://\S+|www\.\S+|doi:\s*\S+|\b10\.\d{4,9}/\S+|[\w.+-]+@[\w-]+\.[\w.]+)"
 )
+DOWNLOAD_NOTICE_RE = re.compile(r"(This content downloaded from|All use subject to|about\.jstor\.org/terms|"
+                                r"Downloaded from|For personal use only|reproduced with permission)", re.I)
 SPEAKER_RE = re.compile(r"^(?:[A-Z][A-Za-z.\-’']{0,20}(?: [A-Z][A-Za-z.\-’']{0,20}){0,2})(?: \[[^\]]{1,30}\])?:\s")
 NUMBERED_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}\.?\s+[A-Z]")
 SENTENCE_END_RE = re.compile(r"[.?!:”\"’)\]]\s*$")
@@ -237,12 +239,22 @@ def _ink_figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
     def bogus(l: dict) -> bool:
         return pymupdf.Rect(l["bbox"]).height > line_h * 2.2
 
+    def line_rect(b: dict, l: dict) -> pymupdf.Rect:
+        """OCR 글자층은 줄 상자가 실제 인쇄된 글자보다 짧은 경우가 많다(JSTOR 스캔 등).
+        본문 줄이면 같은 블록에서 가장 오른쪽 끝까지 늘려서 가린다."""
+        r = pymupdf.Rect(l["bbox"])
+        txt = "".join("".join(ch["c"] for ch in s_["chars"]) for s_ in l["spans"]).strip()
+        if len(txt) >= 25:
+            bx1 = max(pymupdf.Rect(q["bbox"]).x1 for q in b.get("lines", []))
+            r.x1 = max(r.x1, bx1, r.x1 + (r.x1 - r.x0) * 0.15)
+        return r
+
     resid = ink.copy()
     for b in raw["blocks"]:
         for l in b.get("lines", []):
             if bogus(l):
                 continue
-            r = pymupdf.Rect(l["bbox"])
+            r = line_rect(b, l)
             resid[max(0, int((r.y0 - 2) / k)):int((r.y1 + 2) / k) + 1,
                   max(0, int((r.x0 - 2) / k)):int((r.x1 + 2) / k) + 1] = False
     for b in raw["blocks"]:                             # 글자 줄은 지운다 (조금 넓게)
@@ -252,7 +264,7 @@ def _ink_figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
             letters = sum(ch.isalpha() for ch in txt)
             if len(txt) < 12 or letters < len(txt) * 0.55 or bogus(l):
                 continue
-            r = pymupdf.Rect(l["bbox"])
+            r = line_rect(b, l)
             x0, y0 = max(0, int((r.x0 - 2) / k)), max(0, int((r.y0 - 2) / k))
             x1, y1 = int((r.x1 + 2) / k) + 1, int((r.y1 + 2) / k) + 1
             ink[y0:y1, x0:x1] = False
@@ -290,7 +302,8 @@ def _ink_figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
             # 가는 선(표 괘선, 밑줄)이나 작은 얼룩은 그림이 아니다
             if os.environ.get("INK_DEBUG"):
                 print("cand", [round(v) for v in r], n)
-            if r.width >= 20 and r.height >= 40 and n >= 25:
+            strip = r.width < 80 and r.height > r.width * 3
+            if r.width >= 20 and r.height >= 40 and n >= 25 and not strip:
                 py0, py1 = int(r.y0 / k), int(r.y1 / k)
                 px0, px1 = int(r.x0 / k), int(r.x1 / k)
                 total = int(ink[py0:py1, px0:px1].sum())
@@ -331,6 +344,9 @@ def _ink_figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
 
 
 FIG_CAPTION_RE = re.compile(r"^(FIGURE|Figure|Fig\.)\s*\d+")
+# 캡션으로 볼 줄: 'Figure 4.' / 'Figure 4:' / 'FIGURE 4' / 'Fig. 4' / 줄에 'Figure'(번호)만 있는 경우
+# ('Figure 4 presents …' 같은 본문 문장은 캡션이 아니다)
+FIG_CAPTION_STRICT = re.compile(r"^\s*(FIGURE\s*\d+|Fig\.\s*\d+|Figure\s*\d+\s*[.:]|Figure\s*\d*\s*$)")
 
 
 def _caption_anchored_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
@@ -349,10 +365,20 @@ def _caption_anchored_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rec
         return len(t) >= 30 and sum(ch.isalpha() for ch in t) >= len(t) * 0.7
 
     out = []
-    for r, t, braw in lines:
-        if not FIG_CAPTION_RE.match(t):
-            continue
-        cap = pymupdf.Rect(braw) if braw.y0 >= r.y0 - 2 else pymupdf.Rect(r)
+    caps = []
+    for b in raw["blocks"]:
+        bl = [l for l in b.get("lines", []) if abs(l["dir"][0] - 1) <= 0.01]
+        texts = ["".join("".join(ch["c"] for ch in s_["chars"]) for s_ in l["spans"]).strip() for l in bl]
+        for k, (l, t) in enumerate(zip(bl, texts)):
+            # 줄 단위로 본다: OCR 글자층은 캡션을 그림 속 글자와 한 블록으로 묶기도 한다
+            head = t if not re.fullmatch(r"(FIGURE|Figure|Fig\.)\s*", t) else \
+                t + " " + (texts[k + 1] if k + 1 < len(texts) else "")
+            # 본문 중간 줄이 우연히 'Figure 1.'로 시작하는 경우는 제외: 블록 첫 줄이거나 앞 줄이 짧을 때만
+            starts_block = k == 0 or len(texts[k - 1]) < 30
+            if starts_block and (FIG_CAPTION_STRICT.match(t) or FIG_CAPTION_STRICT.match(head)):
+                caps.append((pymupdf.Rect(l["bbox"]), head))
+                break
+    for cap, t in caps:
         x0, x1 = cap.x0, cap.x1
         # 기본 위 경계: 러닝 헤더(쪽 맨 위 짧은 줄) 바로 아래
         head = [lr.y1 for lr, lt, _ in lines if lr.y1 < page.rect.height * 0.12]
@@ -579,6 +605,8 @@ def extract_page(page: pymupdf.Page) -> dict[str, Any]:
         kind = "para"
         if (bbox.y1 < max(HEADER_ZONE, H * 0.115) or bbox.y0 > H - FOOTER_ZONE) and len(plain) < 100:
             kind = "header"
+        elif DOWNLOAD_NOTICE_RE.search(plain) or (re.fullmatch(r"\s*\d{1,4}\s*", plain) and bbox.y0 > H * 0.8):
+            kind = "header"             # 'This content downloaded from …'(JSTOR), 쪽 아래 쪽번호
         elif CAPTION_RE.match(plain) and (plain[:5].isupper() or size < body * 0.95):
             kind = "caption"
         elif size < body * 0.85 and bbox.y0 > H * 0.45:
