@@ -833,7 +833,13 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
                       "producer": "PyMuPDF"})
     out.subset_fonts()
     pdf = out.tobytes(garbage=4, deflate=True)
-    reviews = {pg["page_number"]: (cache.get(str(pg["page_number"])) or {}).get("review", []) for pg in plist}
+    reviews = {pg["page_number"]: list((cache.get(str(pg["page_number"])) or {}).get("review", [])) for pg in plist}
+    # 쪽 경계 문장이 양쪽에 겹쳐 번역된 곳을 찾아 검토 목록에 올린다
+    for pno, dup in core.boundary_overlaps([t for t in tpgs.values() if t is not None]):
+        reviews.setdefault(pno, []).append({"id": f"p{pno}→p{pno + 1}",
+                                            "review": f"쪽 경계에서 같은 내용이 두 쪽에 겹쳐 번역됨: “{dup}” — "
+                                                      f"{pno}·{pno + 1}쪽을 다시 번역해 보세요"})
+    st.session_state.boundary_reviews = {k: v for k, v in reviews.items() if v}
     record = core.structure_record(plist, tpgs, reviews)
     return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8"),
             "json": json.dumps(record, ensure_ascii=False, indent=1).encode("utf-8")}
@@ -861,6 +867,8 @@ if translated_count:
                        mime="application/json", help="쪽별 블록(식별자·위치·원문·번역·검토 기록). 다시 작업할 때 씁니다.")
     review_rows = [(int(k), r) for k, v in cache.items() if k.isdigit() and isinstance(v, dict)
                    for r in v.get("review", []) if start <= int(k) <= end]
+    review_rows += [(k, r) for k, v in (st.session_state.get("boundary_reviews") or {}).items()
+                    for r in v if r["id"].startswith(f"p{k}→") and start <= k <= end]
     if review_rows:
         with st.expander(f"⚠️ 검토가 필요한 곳 {len(review_rows)}개 — 원문과 대조해 보세요"):
             for pno, r in sorted(review_rows, key=lambda x: x[0]):

@@ -2804,3 +2804,29 @@ def load_pages(data: bytes, doc: pymupdf.Document) -> list[dict] | None:
     if obj.get("version") != EXTRACT_VERSION or len(obj.get("pages", [])) != doc.page_count:
         return None
     return _dec(obj["pages"])                  # 돌린 표 쪽의 돌린 원본은 조판할 때 다시 만든다(rotated_source)
+
+
+def boundary_overlaps(tpages: list[dict]) -> list[tuple[int, str]]:
+    """앞 쪽 번역의 끝과 다음 쪽 번역의 시작에 같은 내용이 겹쳐 나오는 곳(쪽 경계 문장을 양쪽에서 다 번역함).
+    반환: [(앞 쪽 번호, 겹친 글)]"""
+    import difflib
+
+    def flow_tr(pg: dict, last: bool) -> str:
+        fl = [b for b in pg.get("blocks", []) if b["kind"] in ("para", "note") and b.get("tr")]
+        if not fl:
+            return ""
+        return plain(fl[-1]["tr"] if last else fl[0]["tr"])
+
+    out = []
+    by = {pg["page_number"]: pg for pg in tpages if pg}
+    for pno, pg in by.items():
+        nxt = by.get(pno + 1)
+        if not nxt:
+            continue
+        a, b = flow_tr(pg, True)[-120:], flow_tr(nxt, False)[:160]
+        if not a or not b:
+            continue
+        m = difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b))
+        if m.size >= 10 and len(a[m.a:m.a + m.size].strip()) >= 8:
+            out.append((pno, a[m.a:m.a + m.size].strip()))
+    return out
