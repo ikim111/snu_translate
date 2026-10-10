@@ -596,9 +596,11 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
     up_base = st.file_uploader("이전 번역 PDF (선택)", type=["pdf"], key="base_up",
                                help="이 앱이 만든 번역 PDF면 쪽 표시(PDF p.N)로 맞추고, 다른 도구로 만든 번역본은 "
                                     "원문과 쪽수가 같을 때 쓸 수 있습니다.")
-    if up_base is not None and st.session_state.get("base_upload_id") != up_base.file_id:
-        st.session_state.base_upload_id = up_base.file_id
-        st.session_state.base_pdf = up_base.getvalue()
+    base_bytes = up_base.getvalue() if up_base is not None else b""
+    base_id = hashlib.md5(base_bytes).hexdigest() if base_bytes else ""
+    if base_bytes and base_bytes != pdf_bytes and st.session_state.get("base_upload_id") != base_id:
+        st.session_state.base_upload_id = base_id
+        st.session_state.base_pdf = base_bytes
         st.session_state.base_src = "올린 파일"
         st.session_state.pop("built", None)
         st.rerun()
