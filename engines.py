@@ -30,15 +30,39 @@ OPENAI_MODELS: dict[str, tuple[str, float, float]] = {
     "gpt-6.1-sol": ("고품질", 2.00, 10.00),
 }
 DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"   # 앱을 열었을 때 기본으로 선택되는 모델
+_RATE: dict[str, float] = {}
+FALLBACK_USD_KRW = 1400.0
+
+
+def usd_krw_rate() -> tuple[float, bool]:
+    """달러→원 환율. 공개 환율 API에서 받아 6시간 동안 다시 쓴다. 실패하면 (대략값, False)."""
+    import time
+    import urllib.request
+
+    now = time.time()
+    if _RATE and now - _RATE.get("t", 0) < 6 * 3600:
+        return _RATE["v"], bool(_RATE.get("live"))
+    try:
+        with urllib.request.urlopen("https://open.er-api.com/v6/latest/USD", timeout=4) as r:
+            v = float(json.loads(r.read().decode())["rates"]["KRW"])
+        _RATE.update(t=now, v=v, live=1)
+        return v, True
+    except Exception:
+        _RATE.update(t=now - 5 * 3600, v=_RATE.get("v", FALLBACK_USD_KRW), live=_RATE.get("live", 0))
+        return _RATE["v"], bool(_RATE.get("live"))
+
+
 def fmt_usd(usd: float | None) -> str:
-    """비용 표시 (달러). 환율은 바뀌므로 원화로 바꾸지 않는다."""
+    """비용 표시: 달러 + 괄호 안에 원화(그날 환율로 환산한 대략값)."""
     if usd is None:
         return ""
     if usd <= 0:
         return "$0"
-    if usd < 0.01:
-        return "$0.01 미만"
-    return f"${usd:,.2f}"
+    rate, live = usd_krw_rate()
+    won = usd * rate
+    won_s = f"{round(won, -1):,.0f}원" if won >= 10 else "10원 미만"
+    usd_s = "$0.01 미만" if usd < 0.01 else f"${usd:,.2f}"
+    return f"{usd_s} (약 {won_s}{'' if live else ', 대략 환율'})"
 
 
 class EngineError(Exception):
