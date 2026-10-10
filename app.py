@@ -343,8 +343,9 @@ if bad:
 start, end = st.slider("번역할 페이지 범위", 1, n_pages, (1, n_pages))
 sel = [pg for pg in pages if start <= pg["page_number"] <= end]
 
-prompt_ver = engines.PROMPT_VERSION if engine_name == "OpenAI" else ""
-opts_sig = hashlib.md5(json.dumps([engine_name, model, prompt_ver, target, translate_refs, translate_captions,
+# 번역 지시문 버전은 캐시 키에 넣지 않는다: 지시문이 바뀌어도 이미 번역한 쪽은 그대로 두고,
+# 고치고 싶은 쪽만 '쪽별로 다시 번역'으로 새 지시문을 적용한다 (번역비 절약)
+opts_sig = hashlib.md5(json.dumps([engine_name, model, target, translate_refs, translate_captions,
                                    glossary_entries],
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
@@ -390,9 +391,36 @@ def cached_ok(pg: dict) -> bool:
     return bool(e) and e.get("sig") == units_sig(pg) and len(e.get("tr", [])) == len(units_of(pg))
 
 
-todo = [pg for pg in sel if pg["mode"] == "text" and not cached_ok(pg)]
+# ── 이전 번역본(기준 PDF): 다시 번역하지 않는 쪽은 여기서 그대로 가져와 합친다 ──
+if st.session_state.get("base_for") != pdf_hash:
+    st.session_state.base_for = pdf_hash
+    st.session_state.base_pdf = None
+    st.session_state.base_src = ""
+    if lib is not None:
+        try:
+            raw = lib.get_file(paper_id, "translation.pdf")
+            if raw:
+                st.session_state.base_pdf = raw
+                st.session_state.base_src = "서재"
+        except library.LibraryError:
+            pass
+base_doc = None
+base_map: dict[int, list[int]] = {}
+if st.session_state.get("base_pdf"):
+    try:
+        base_doc = pymupdf.open(stream=st.session_state.base_pdf, filetype="pdf")
+        base_map = core.map_translated_pages(base_doc, n_pages)
+    except Exception:
+        base_doc, base_map = None, {}
+
+
+def has_translation(pg: dict) -> bool:
+    return cached_ok(pg) or pg["page_number"] in base_map
+
+
+todo = [pg for pg in sel if pg["mode"] == "text" and not has_translation(pg)]
 need_chars = sum(len(core.plain(h)) for pg in todo for *_, h in units_of(pg))
-done_in_range = sum(1 for pg in sel if cached_ok(pg))
+done_in_range = sum(1 for pg in sel if has_translation(pg))
 if engine_name == "OpenAI":
     krw = engines.openai_cost_krw(model, need_chars)
     cost = f" · 예상 비용 약 {krw:,}원" if krw is not None else ""
@@ -491,7 +519,8 @@ def translate_page(engine: engines.Engine, pg: dict) -> list[str]:
     return engine.translate([h for *_, h in units]) if units else []
 
 
-if st.button("번역 시작", type="primary", disabled=not todo):
+def run_translation(targets: list[dict]) -> None:
+    """targets 쪽들을 번역해 캐시에 저장한다 (이미 번역된 쪽이어도 새로 번역해 덮어쓴다)."""
     if not api_key:
         st.error(f"사이드바에 {engine_name} API Key를 입력하세요.")
         st.stop()
@@ -516,14 +545,15 @@ if st.button("번역 시작", type="primary", disabled=not todo):
     # 페이지 단위로 번역하고, 끝나는 대로 저장한다. OpenAI는 여러 페이지를 동시에 보낸다.
     done = 0
     with ThreadPoolExecutor(max_workers=engine.workers) as pool:
-        futures = {pool.submit(translate_page, engine, pg): pg for pg in todo}
-        status.write(f"번역 중… 0 / {len(todo)}쪽")
+        futures = {pool.submit(translate_page, engine, pg): pg for pg in targets}
+        status.write(f"번역 중… 0 / {len(targets)}쪽")
         for fut in as_completed(futures):
             pg = futures[fut]
             pno = pg["page_number"]
             try:
                 tr = fut.result()
                 cache[str(pno)] = {"tr": tr, "sig": units_sig(pg),
+                                   "pv": engines.PROMPT_VERSION if engine_name == "OpenAI" else "",
                                    "original": core.page_text(pg, translated=False)}
                 save_cache(cache_key, cache)
             except engines.EngineError as e:
@@ -535,19 +565,53 @@ if st.button("번역 시작", type="primary", disabled=not todo):
             except Exception as e:
                 failures[pno] = f"번역 실패: {e}"
             done += 1
-            bar.progress(done / len(todo))
-            status.write(f"번역 중… {done} / {len(todo)}쪽 (방금 끝난 페이지: {pno})")
+            bar.progress(done / len(targets))
+            status.write(f"번역 중… {done} / {len(targets)}쪽 (방금 끝난 페이지: {pno})")
 
-    status.write(f"번역 완료 페이지: {sum(1 for pg in sel if cached_ok(pg))} / {len(sel)}")
+    status.write(f"번역 끝: {len(targets) - len(failures)} / {len(targets)}쪽")
     if fatal:
         st.error(f"{fatal} — 번역을 멈췄습니다. 지금까지 번역한 페이지는 저장되어 있습니다.")
     for pno, msg in sorted(failures.items()):
         if msg != fatal:
             st.error(f"Page {pno} 번역 실패 — {msg}")
     if failures:
-        st.info("'번역 시작'을 다시 누르면 남은 페이지부터 이어서 번역합니다.")
+        st.info("다시 누르면 남은 페이지부터 이어서 번역합니다.")
     st.session_state.pop("built", None)
     st.session_state.autosave = True          # 아래에서 PDF를 만든 뒤 서재에 저장
+
+
+if st.button("번역 시작", type="primary", disabled=not todo,
+             help="아직 번역하지 않은 쪽만 번역합니다." if base_map else None):
+    run_translation(todo)
+
+# ── 쪽별로 다시 번역: 마음에 안 드는 쪽만 새로 번역해 이전 번역본과 합친다 ──
+with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool(base_map) and not todo):
+    if base_map:
+        src_name = st.session_state.get("base_src") or "올린 파일"
+        st.caption(f"이전 번역본({src_name})에서 {len(base_map)}쪽을 그대로 가져옵니다. "
+                   "아래에 적은 쪽만 새로 번역해서 바꿔 끼우고, 합친 PDF를 다시 서재에 저장합니다.")
+    else:
+        st.caption("이전 번역본이 없습니다. 예전에 받아 둔 번역 PDF가 있으면 올려 주세요. "
+                   "그 파일을 바탕으로 고칠 쪽만 새로 번역합니다.")
+    up_base = st.file_uploader("이전 번역 PDF (선택)", type=["pdf"], key="base_up",
+                               help="이 앱이 만든 번역 PDF면 쪽 표시(PDF p.N)로 맞추고, 다른 도구로 만든 번역본은 "
+                                    "원문과 쪽수가 같을 때 쓸 수 있습니다.")
+    if up_base is not None and st.session_state.get("base_upload_id") != up_base.file_id:
+        st.session_state.base_upload_id = up_base.file_id
+        st.session_state.base_pdf = up_base.getvalue()
+        st.session_state.base_src = "올린 파일"
+        st.session_state.pop("built", None)
+        st.rerun()
+    redo_text = st.text_input("다시 번역할 쪽 (PDF 쪽 번호)", placeholder="예: 3, 12, 20-23",
+                              help="번역 PDF 오른쪽 위의 'PDF p.N' 번호를 적으세요.")
+    redo = [pages[k - 1] for k in core.parse_page_list(redo_text, n_pages)] if redo_text else []
+    redo = [pg for pg in redo if pg["mode"] == "text"]
+    if redo:
+        rc = sum(len(core.plain(h)) for pg in redo for *_, h in units_of(pg))
+        krw2 = engines.openai_cost_krw(model, rc) if engine_name == "OpenAI" else None
+        st.caption(f"{len(redo)}쪽 · 원문 약 {rc:,}자" + (f" · 예상 비용 약 {krw2:,}원" if krw2 is not None else ""))
+    if st.button("이 쪽만 다시 번역", disabled=not redo):
+        run_translation(redo)
 
 
 # ─────────────────────────── 결과 만들기 ───────────────────────────
@@ -576,11 +640,19 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
             out.insert_pdf(src, from_page=pno - 1, to_page=pno - 1)
         if tpg is not None:
             core.render_page(out, src, tpg)
+        elif base_doc is not None and pno in base_map:
+            for i in base_map[pno]:               # 이전 번역본의 쪽을 그대로
+                out.insert_pdf(base_doc, from_page=i, to_page=i)
         elif pg["mode"] == "text":
             core.render_page(out, src, pg, note="번역되지 않음 — 원문 그대로")
         else:
             core.render_page(out, src, pg)
-        body = core.page_text(tpg) if tpg else "(번역 없음 — 원문 참조)"
+        if tpg is not None:
+            body = core.page_text(tpg)
+        elif base_doc is not None and pno in base_map:
+            body = "\n".join(base_doc[i].get_text() for i in base_map[pno]).strip()
+        else:
+            body = "(번역 없음 — 원문 참조)"
         orig = core.page_text(pg, translated=False)
         txt.append(f"──────────── Page {pno} ────────────\n\n{body}\n")
         md.append(f"# Page {pno}\n\n## Translation\n\n{body}\n\n## Original\n\n{orig}\n")
@@ -589,9 +661,12 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
     return {"pdf": pdf, "txt": "\n".join(txt).encode("utf-8"), "md": "\n".join(md).encode("utf-8")}
 
 
-translated_count = sum(1 for pg in sel if cached_ok(pg))
+translated_count = sum(1 for pg in sel if has_translation(pg))
 if translated_count:
-    build_sig = (cache_key, start, end, interleave, len(cache))
+    build_sig = (cache_key, start, end, interleave, len(cache),
+                 hashlib.md5(json.dumps({k: v.get("tr") for k, v in cache.items()}, ensure_ascii=False)
+                             .encode()).hexdigest(),
+                 len(st.session_state.get("base_pdf") or b""))
     if st.session_state.get("built", (None,))[0] != build_sig:
         with st.spinner("번역 PDF 만드는 중…"):
             st.session_state.built = (build_sig, build_outputs())
@@ -615,7 +690,7 @@ if translated_count:
     def save_to_library() -> None:
         # 서재에는 범위와 상관없이 '논문 전체'를 저장한다. 나눠서 번역해도 지금까지 번역한
         # 모든 쪽이 한 파일에 모이고, 아직 번역하지 않은 쪽은 원문 그대로 들어간다.
-        done_pages = [pg["page_number"] for pg in pages if cached_ok(pg)]
+        done_pages = [pg["page_number"] for pg in pages if has_translation(pg)]
         with st.spinner("서재용 전체 PDF 만드는 중…"):
             full_pdf = build_outputs(pages)["pdf"]
         meta = {
@@ -632,6 +707,8 @@ if translated_count:
                                   "progress.json": progress})
         st.session_state.pop("lib_items", None)
         st.session_state.lib_meta = None
+        st.session_state.base_pdf = full_pdf
+        st.session_state.base_src = "서재"
 
     if lib is not None:
         if st.session_state.pop("autosave", False):
@@ -660,7 +737,11 @@ if translated_count:
     with right:
         st.caption(f"번역 p.{view_p}")
         tpg = translated_page(pg)
-        if tpg is None:
+        if tpg is None and base_doc is not None and view_p in base_map:
+            st.caption("이전 번역본의 쪽입니다 — 고치려면 위 '🧩 마음에 안 드는 쪽만 다시 번역'에 이 쪽 번호를 적으세요.")
+            for i in base_map[view_p]:
+                st.image(base_doc[i].get_pixmap(dpi=110).tobytes("png"), width="stretch")
+        elif tpg is None:
             st.info("이 페이지는 아직 번역되지 않았습니다." if pg["mode"] == "text" else "원문 그대로 들어가는 페이지입니다.")
         else:
             one = pymupdf.open()

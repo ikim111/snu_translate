@@ -1413,3 +1413,41 @@ def annotate_first_terms(pages: list[dict], glossary: dict[str, str]) -> None:
                     del pending[en]
             if not pending:
                 return
+
+
+# ─────────────────────── 9. 이전 번역본 재사용 ───────────────────────
+def map_translated_pages(doc: pymupdf.Document, n_pages: int) -> dict[int, list[int]]:
+    """이전에 만든 번역 PDF의 각 쪽이 원문 몇 쪽인지 → {원문 쪽 번호: [번역 PDF 쪽 인덱스, …]}.
+    이 앱이 만든 PDF는 오른쪽 위 'PDF p.N' 표시로 찾는다('원문 그대로' 표시가 붙은 미번역 쪽은 제외).
+    표시가 없는 PDF(다른 도구로 만든 번역본)는 쪽수가 원문과 같을 때만 1:1로 대응시킨다."""
+    found: dict[int, list[int]] = {}
+    any_label = False
+    for i, page in enumerate(doc):
+        top = page.get_text(clip=pymupdf.Rect(0, 0, page.rect.width, 56))
+        m = re.search(r"PDF p\.(\d+)", top)
+        if not m:
+            continue
+        any_label = True
+        if "원문 그대로" in top:
+            continue
+        found.setdefault(int(m.group(1)), []).append(i)
+    if any_label:
+        return {k: v for k, v in found.items() if 1 <= k <= n_pages}
+    if doc.page_count == n_pages:
+        return {i + 1: [i] for i in range(n_pages)}
+    return {}
+
+
+def parse_page_list(text: str, n_pages: int) -> list[int]:
+    """'3, 12, 20-23' → [3, 12, 20, 21, 22, 23]"""
+    out: set[int] = set()
+    for part in re.split(r"[,\s]+", text.strip()):
+        m = re.fullmatch(r"(\d+)(?:\s*[-~]\s*(\d+))?", part)
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2) or a)
+        for k in range(min(a, b), max(a, b) + 1):
+            if 1 <= k <= n_pages:
+                out.add(k)
+    return sorted(out)
