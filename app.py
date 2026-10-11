@@ -542,7 +542,11 @@ def paper_text_for_terms() -> str:
     return "\n".join(parts)
 
 
-with st.expander("📖 이 논문의 용어 추천받기", expanded=False):
+any_done = any(has_translation(pg) for pg in pages)
+terms_done = pdf_hash in st.session_state.setdefault("terms_done", set())
+fresh_paper = not any_done and not terms_done
+with st.expander("① 이 논문의 용어 추천받기 (권장 · 번역 전에)" if fresh_paper else "📖 이 논문의 용어 추천받기",
+                 expanded=fresh_paper or bool(st.session_state.get("term_suggestions"))):
     st.caption("OpenAI가 이 논문에서 반복되는 핵심 용어와 번역어를 제안합니다. 확인·수정 후 확정하면 용어집에 추가되고"
                + (" 서재에 저장되어 다음 논문에도 쓰입니다." if lib is not None else "니다.")
                + " 번역 전에 해 두세요.")
@@ -563,6 +567,9 @@ with st.expander("📖 이 논문의 용어 추천받기", expanded=False):
                 st.error(str(e))
     if not openai_key:
         st.caption("OpenAI API Key가 필요합니다.")
+    if fresh_paper and st.button("건너뛰기 (기존 용어집으로 번역)"):
+        st.session_state.terms_done.add(pdf_hash)
+        st.rerun()
 
     sug = st.session_state.get("term_suggestions")
     if sug and sug[0] == pdf_hash:
@@ -585,6 +592,7 @@ with st.expander("📖 이 논문의 용어 추천받기", expanded=False):
                     merged[str(row["영어"]).strip()] = str(row["한국어"]).strip()
             st.session_state.glossary_pending = glossary_to_text(merged)
             st.session_state.pop("term_suggestions", None)
+            st.session_state.terms_done.add(pdf_hash)
             if lib is not None:
                 try:
                     lib.save_glossary(merged)
@@ -749,7 +757,9 @@ def run_translation(targets: list[dict]) -> None:
     st.session_state.autosave = True          # 아래에서 PDF를 만든 뒤 서재에 저장
 
 
-if st.button("번역 시작", type="primary", disabled=not todo,
+if fresh_paper and todo:
+    st.caption("💡 용어 추천을 먼저 받으면 논문 전체에서 핵심 용어가 같은 말로 번역됩니다. 바로 번역해도 됩니다.")
+if st.button("② 번역 시작" if fresh_paper or not any_done else "번역 시작", type="primary", disabled=not todo,
              help="아직 번역하지 않은 쪽만 번역합니다." if base_map else None):
     run_translation(todo)
 
