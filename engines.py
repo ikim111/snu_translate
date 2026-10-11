@@ -283,7 +283,7 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 입력과 같은 개수, 같은 순서로, 각 결과를 원래 id와 연결한다. translation에 작업 설명, 사과, 검수 의견, 완료 선언을 섞지 않는다."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-11b"
+PROMPT_VERSION = "2026-10-11c"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:
@@ -443,7 +443,7 @@ text(번역 대상), 그리고 쪽 경계에서만 context_before / context_afte
 입력과 같은 개수, 같은 순서로, 각 결과를 원래 id와 연결한다. translation에 작업 설명, 사과, 검수 의견, 완료 선언을 섞지 않는다."""
 
 # 지시문이 바뀌면 이전 번역 캐시를 쓰지 않도록 버전을 둔다
-PROMPT_VERSION = "2026-10-11b"
+PROMPT_VERSION = "2026-10-11c"
 
 
 def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[str, str]) -> Engine:
@@ -848,7 +848,9 @@ FIG_PROMPT = """당신은 수학교육·통계교육 논문의 그림을 읽고 
 - source에는 이미지에 실제로 보이는 원문을 그대로 쓴다. 보이지 않거나 흐려서 확실하지 않은 글자를 추측해 채우지 않는다.
   일부를 읽을 수 없으면 읽은 부분만 쓰고 status를 "needs_review", review에 위치와 이유를 쓴다. "…"로 대체하지 않는다.
 - translation: 학술적이고 간결한 번역. 고유명사·약어·기호·수치는 그대로 둔다. 별표(*) 등 원문 기호는 유지한다.
-- 그림 내용을 해석하거나 설명을 덧붙이지 않는다.{glossary}
+- 그림 내용을 해석하거나 설명을 덧붙이지 않는다.
+- 단어 뜻은 아래 '논문 맥락'에 맞춘다. 본문 번역에서 이미 쓴 번역어가 있으면 그림에서도 같은 말을 쓴다.
+  예: 형평성·사회 정의를 다루는 글의 'Power'는 '권력'이지 통계의 '검정력'이 아니다. 짧은 단어를 분야 관용어로 단정하지 않는다.{glossary}{context}
 출력: {{"items": [{{"source": 원문, "translation": 번역, "status": "ok" 또는 "needs_review", "review": ""}}]}}"""
 
 FIG_SCHEMA = {
@@ -863,7 +865,7 @@ FIG_SCHEMA = {
 
 
 def figure_labels(api_key: str, model: str, png: bytes, target: str = "KO",
-                  glossary_entries: dict[str, str] | None = None) -> list[dict]:
+                  glossary_entries: dict[str, str] | None = None, context: str = "") -> list[dict]:
     """그림 이미지 → [{source, translation, status, review}] (그림 속 문구와 번역)."""
     import openai
 
@@ -874,7 +876,8 @@ def figure_labels(api_key: str, model: str, png: bytes, target: str = "KO",
     url = "data:image/png;base64," + base64.b64encode(png).decode()
     kw: dict[str, Any] = dict(
         model=model,
-        instructions=FIG_PROMPT.format(lang=LANG_NAME.get(target, target), glossary=gloss),
+        instructions=FIG_PROMPT.format(lang=LANG_NAME.get(target, target), glossary=gloss,
+                                       context=("\n\n논문 맥락(번역 대상 아님, 뜻을 정하는 참고용):\n" + context) if context else ""),
         input=[{"role": "user", "content": [
             {"type": "input_text", "text": "이 그림 속 문구를 읽고 번역하라."},
             {"type": "input_image", "image_url": url, "detail": "high"},

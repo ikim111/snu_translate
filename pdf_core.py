@@ -1845,9 +1845,13 @@ def _gutter(blocks: list[dict], page_rect: pymupdf.Rect) -> float | None:
     """2단이면 두 단 사이 가운데 x, 1단이면 None.
     본문 블록 대부분이 쪽 가운데선을 넘지 않고 좌우 양쪽에 있으면 2단으로 본다."""
     mid = page_rect.width / 2
-    body = [b for b in blocks if b["kind"] in ("para", "list", "heading", "dialogue", "reference", "note")
+    body = [b for b in blocks if b["kind"] in ("para", "list", "heading", "dialogue", "reference", "note",
+                                               "caption", "figure", "table")
             and not b["bbox"].is_empty and b["bbox"].width > 20]
-    if len(body) < 3:
+    # 블록이 2개뿐이어도 좌우에 쪽 높이 절반이 넘는 긴 문단이 하나씩 있으면 2단 (그림이 한 단에 들어간 쪽)
+    tall = [b for b in body if b["kind"] in ("para", "reference", "list") and b["bbox"].height > page_rect.height * 0.5]
+    if len(body) < 3 and not (len(tall) >= 2 and any(b["bbox"].x1 <= mid + 12 for b in tall)
+                              and any(b["bbox"].x0 >= mid - 12 for b in tall)):
         return None
     left = [b for b in body if b["bbox"].x1 <= mid + 12]
     right = [b for b in body if b["bbox"].x0 >= mid - 12]
@@ -2047,6 +2051,10 @@ def mark_references(pages: list[dict]) -> None:
                 in_refs = False
             if in_refs and b["kind"] == "heading" and AUTHOR_START_RE.match(b["text"].strip()) and b.get("lines"):
                 b["kind"] = "para"                 # 굵게 읽힌 첫 참고문헌 항목
+            elif in_refs and b["kind"] == "heading" and len(b["text"].strip()) < 60 \
+                    and not re.search(r"[,&(\d]|[-.]$", b["text"].strip()):
+                flush()                            # 참고문헌 뒤의 새 절('Post-Reading Questions', 'Author')
+                in_refs = False
             if in_refs and b["kind"] in ("para", "footnote", "note", "list") and b.get("lines"):
                 ref_lines.extend(b["lines"])
                 continue
@@ -2136,7 +2144,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-11b"
+EXTRACT_VERSION = "2026-10-11c"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
@@ -2470,7 +2478,7 @@ def _mark_repeated_margins(pages: list[dict]) -> None:
             if b["kind"] in ("heading", "para", "footnote", "note") and b.get("bbox") is not None \
                     and len(b.get("text", "")) < 120 and norm(b.get("text", "")):
                 same = {i for i, y in seen[norm(b["text"])] if abs(y - b["bbox"].y0) <= 4}
-                if len(same) >= 3:
+                if len(same) >= 3 and pg_i != min(same):   # 처음 나오는 쪽 하나는 남긴다(학술지 정보 1회 표시)
                     b["kind"] = "header"
 
 
@@ -3022,6 +3030,27 @@ def bookmarks(tpages: list[dict]) -> list[list]:
 def figure_jobs(pg: dict) -> list[tuple[int, dict]]:
     """그림 속 문구를 번역할 그림 블록 [(블록 번호, 블록)]."""
     return [(bi, b) for bi, b in enumerate(pg.get("blocks", [])) if b["kind"] == "figure"]
+
+
+def figure_context(pages: list[dict], pg: dict, fig: dict, page_translation: str = "") -> str:
+    """그림 속 짧은 문구를 번역할 때 함께 넘길 맥락: 논문 제목, 그림 캡션·제목, 같은 쪽 본문(원문과 번역).
+    맥락 없이 'Power'만 보면 통계의 '검정력'으로 옮기기 쉽다 → 본문에서 쓴 뜻과 번역어를 따르게 한다."""
+    title = next((b["text"] for p in pages for b in p.get("blocks", [])
+                  if b["kind"] == "heading" and b.get("title")), "")
+    r = fig.get("bbox")
+    caps = [b["text"] for b in pg.get("blocks", []) if b["kind"] == "caption" and r is not None
+            and b.get("bbox") is not None and (abs(b["bbox"].y0 - r.y1) < 80 or abs(r.y0 - b["bbox"].y1) < 80)]
+    body = " ".join(b["text"] for b in pg.get("blocks", []) if b["kind"] in ("para", "list", "note"))
+    parts = []
+    if title:
+        parts.append(f"논문 제목: {title[:200]}")
+    if caps:
+        parts.append("그림 캡션·제목: " + " / ".join(c[:200] for c in caps))
+    if body:
+        parts.append("같은 쪽 본문(원문 일부): " + body[:1200])
+    if page_translation:
+        parts.append("같은 쪽 본문 번역(이미 정한 번역어 — 그림에서도 같은 말로): " + page_translation[:1200])
+    return "\n".join(parts)
 
 
 def fig_key(b: dict) -> str:

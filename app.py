@@ -154,6 +154,8 @@ with st.sidebar:
     if st.session_state.pop("goto_translate", False):
         st.session_state.menu = "번역하기"
     menu = st.radio("메뉴", ["번역하기", "📚 내 서재"], horizontal=True, label_visibility="collapsed", key="menu")
+    # 배포된 버전 확인용 (원문 읽기 방식·번역 지시문 버전)
+    st.caption(f"앱 버전: 읽기 {core.EXTRACT_VERSION} · 번역 {engines.PROMPT_VERSION}")
 if menu == "📚 내 서재":
     render_library()
     st.stop()
@@ -647,7 +649,8 @@ def translate_page(engine: engines.Engine, pg: dict, all_pages: list[dict],
     for bi, b in core.figure_jobs(pg):
         key = core.fig_key(b)
         if engine_name == "OpenAI" and translate_captions:
-            items = engines.figure_labels(api_key, model, pngs[key], target, glossary_entries)
+            ctx = core.figure_context(all_pages, pg, b, " ".join(core.plain(t) for t in (tr or []) if t))
+            items = engines.figure_labels(api_key, model, pngs[key], target, glossary_entries, ctx)
             f = {"src": [x["source"] for x in items], "tr": [x["translation"] for x in items],
                  "review": [f'{x["source"]}: {x["review"] or "판독 확인 필요"}' for x in items
                             if x["status"] == "needs_review"]}
