@@ -63,7 +63,7 @@ NUMBERED_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d{1,2}){0,3}\.?\s+[A-Z]")
 SENTENCE_END_RE = re.compile(r"[.?!:”\"’)\]]\s*$")
 CAPTION_RE = re.compile(r"^(FIGURE|Figure|Fig\.|TABLE|Table)\s*\d+", re.S)
 REF_HEAD_RE = re.compile(r"^(REFERENCES|References|Bibliography|BIBLIOGRAPHY|Works Cited|참고문헌)\s*$")
-END_REF_RE = re.compile(r"^(APPENDIX|Appendix|부록)\b")
+END_REF_RE = re.compile(r"^(APPENDIX|Appendix|부록|Authors?|AUTHORS?|About the Authors?)\b\s*$|^(APPENDIX|Appendix|부록)\b")
 ABBREV = ("e.g.", "i.e.", "et al.", "cf.", "vs.", "pp.", "p.", "Vol.", "No.", "Fig.", "Eds.", "Ed.")
 BULLETS = ("•", "–", "·", "▪", "◦")
 
@@ -205,6 +205,9 @@ def join_lines(lines: list[dict]) -> tuple[str, str]:
     for t in ("i", "b", "u"):                   # 줄마다 나뉜 태그를 하나로
         html = html.replace(f"</{t}><{t}>", "")
         html = re.sub(rf"</{t}>\s+<{t}>", " ", html)
+    if "<i>" in html:                           # 기울임이 단어 중간(줄바꿈 하이픈 자리)에서 시작·끝나면 단어 전체로
+        html = re.sub(r"(\w+)<i>(?=\w)", r"<i>\1", html)
+        html = re.sub(r"(?<=\w)</i>(\w+)", r"\1</i>", html)
     return html, plain
 
 
@@ -961,6 +964,207 @@ def _extract_rotated_scan(page: pymupdf.Page) -> dict[str, Any] | None:
     return pg
 
 
+def _edge_slant(page: pymupdf.Page, r: pymupdf.Rect) -> float:
+    """글자 줄 그림에서 세로에 가까운 윤곽선들의 평균 기울기(위쪽이 오른쪽으로 갈수록 +).
+    똑바른 글씨는 약 0(±0.015), 기울여 그린 글씨는 0.02~0.1. 둥근 글자뿐인 단어('Access')도 잡힌다."""
+    import numpy as np
+    pix = page.get_pixmap(dpi=300, clip=r, colorspace=pymupdf.csGRAY)
+    if pix.w < 8 or pix.h < 4:
+        return 0.0
+    a = 255.0 - np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
+    gx = np.zeros_like(a)
+    gy = np.zeros_like(a)
+    gx[:, 1:-1] = a[:, 2:] - a[:, :-2]
+    gy[1:-1, :] = a[2:, :] - a[:-2, :]
+    m = (np.abs(gx) > 2.5 * np.abs(gy)) & (np.abs(gx) > 40)
+    if m.sum() < 20:
+        return 0.0
+    w = np.abs(gx[m])
+    return float(((gy[m] / gx[m]) * w).sum() / w.sum())
+
+
+def _mark_synthetic_italics(page: pymupdf.Page, raw: dict) -> None:
+    """정체 글꼴을 기울여 그려 이탤릭처럼 보이게 만든 글자(글꼴 이름·속성에 이탤릭 표시가 없음)를 찾아 이탤릭으로 표시한다.
+    같은 줄 안에서 같은 글꼴이 따로 끊겨 그려진 조각만 후보로 보고, 그 조각의 그림이 기울어 있는지 잰다."""
+    if _page_is_image_backed(page):
+        return                                     # 스캔 쪽은 글자층과 그림이 따로라 잴 수 없다
+    traces = [t for t in page.get_texttrace() if t.get("type") == 0 and t.get("chars")]
+    rows: dict[int, list[tuple[int, list]]] = {}
+    for ti, t in enumerate(traces):
+        by_row: dict[int, list] = {}
+        for c in t["chars"]:
+            by_row.setdefault(round(c[2][1]), []).append(c)
+        for y, cs in by_row.items():
+            rows.setdefault(y, []).append((ti, cs))
+    italic_keys: set[tuple[int, int]] = set()
+    checked = 0
+    for y, segs in rows.items():
+        if len(segs) < 2:
+            continue
+        for ti, cs in segs:
+            t = traces[ti]
+            if ITALIC_NAME_RE.search(t.get("font", "")) or t.get("flags", 0) & ITALIC_FLAG:
+                continue
+            if not any(oti != ti and traces[oti].get("font") == t.get("font")
+                       and abs(traces[oti].get("size", 0) - t.get("size", 0)) < 0.3 for oti, _ in segs):
+                continue
+            txt = "".join(chr(c[0]) for c in cs)
+            if len(txt.replace(" ", "")) < 4 or sum(ch.isalpha() for ch in txt) < 3 or checked > 300:
+                continue
+            checked += 1
+            r = pymupdf.Rect(min(c[3][0] for c in cs) - 1, min(c[3][1] for c in cs),
+                             max(c[3][2] for c in cs) + 3, max(c[3][3] for c in cs))
+            if _edge_slant(page, r) >= 0.018:
+                italic_keys |= {(round(c[2][0]), round(c[2][1])) for c in cs}
+    # 밑줄로 강조한 글자(가는 가로 선이 글자 기준선 바로 아래)도 원문 강조이므로 기울임과 같이 표시한다
+    try:
+        unders = [d["rect"] for d in page.get_drawings()
+                  if d["rect"].height <= 1.6 and d["rect"].width >= 8 and d.get("fill") not in ((1.0, 1.0, 1.0),)]
+    except Exception:
+        unders = []
+    if unders:
+        for b in raw.get("blocks", []):
+            for ln in b.get("lines", []) if b.get("type", 0) == 0 else []:
+                for sp in ln.get("spans", []):
+                    for c in sp.get("chars") or []:
+                        cx, oy = (c["bbox"][0] + c["bbox"][2]) / 2, c["origin"][1]
+                        if c.get("c", "").strip() and any(u.x0 - 1 <= cx <= u.x1 + 1 and -0.5 <= u.y0 - oy <= 3.5
+                                                          for u in unders):
+                            italic_keys.add((round(c["origin"][0]), round(c["origin"][1])))
+    if not italic_keys:
+        return
+    for b in raw.get("blocks", []):
+        for ln in b.get("lines", []) if b.get("type", 0) == 0 else []:
+            new_spans = []
+            for sp in ln.get("spans", []):
+                chars = sp.get("chars") or []
+                runs: list[tuple[bool, list]] = []
+                for c in chars:
+                    # 공백은 기울임 구간에 넣지 않는다 (넣으면 'not want'가 'notwant'로 붙는다)
+                    it = bool(c.get("c", "").strip()) and \
+                        (round(c["origin"][0]), round(c["origin"][1])) in italic_keys
+                    if runs and runs[-1][0] == it:
+                        runs[-1][1].append(c)
+                    else:
+                        runs.append((it, [c]))
+                if len(runs) <= 1 and not (runs and runs[0][0]):
+                    new_spans.append(sp)
+                    continue
+                for it, cs in runs:
+                    nsp = dict(sp, chars=cs, bbox=(min(c["bbox"][0] for c in cs), sp["bbox"][1],
+                                                   max(c["bbox"][2] for c in cs), sp["bbox"][3]))
+                    if it:
+                        nsp["flags"] = sp["flags"] | ITALIC_FLAG
+                    new_spans.append(nsp)
+            ln["spans"] = new_spans
+
+
+def _drop_overprint(raw: dict, tol: float = 1.0) -> dict:
+    """같은 글자를 거의 같은 자리에 여러 번 겹쳐 찍은 '가짜 굵은 글씨'(일부 PDF 제작 도구)를 하나만 남긴다.
+    겹쳐 찍은 사본을 따로 읽으면 제목·이름이 네 번씩 반복되어 번역된다. (글자 단위로 비교: 사본마다 span 나눔이 다르다)"""
+    grid: dict[tuple[str, int, int], list[tuple[float, float]]] = {}
+
+    def dup(ch: str, x: float, y: float) -> bool:
+        gx, gy = int(x // 2), int(y // 2)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for (ox, oy) in grid.get((ch, gx + dx, gy + dy), ()):
+                    if abs(ox - x) <= tol and abs(oy - y) <= tol:
+                        return True
+        grid.setdefault((ch, gx, gy), []).append((x, y))
+        return False
+
+    changed = False
+    for b in raw.get("blocks", []):
+        if b.get("type", 0) != 0:
+            continue
+        for ln in b.get("lines", []):
+            for sp in ln.get("spans", []):
+                chars = sp.get("chars")
+                if not chars:
+                    continue
+                keep = [c for c in chars if not c.get("c", "").strip() or
+                        not dup(c["c"], c["origin"][0], c["origin"][1])]
+                if len(keep) != len(chars):
+                    changed = True
+                    # 사본에서 남은 것이 공백뿐이면 span 통째로 버린다
+                    sp["chars"] = keep if any(c.get("c", "").strip() for c in keep) else []
+                    if sp["chars"]:
+                        xs = [c["bbox"][0] for c in sp["chars"]] + [c["bbox"][2] for c in sp["chars"]]
+                        sp["bbox"] = (min(xs), sp["bbox"][1], max(xs), sp["bbox"][3])
+            ln["spans"] = [sp for sp in ln.get("spans", []) if sp.get("chars") or "chars" not in sp]
+        b["lines"] = [ln for ln in b.get("lines", []) if ln["spans"]]
+    if changed:
+        raw["blocks"] = [b for b in raw.get("blocks", []) if b.get("type", 0) != 0 or b.get("lines")]
+        for b in raw["blocks"]:                    # 줄·블록 경계 상자도 남은 글자에 맞춘다
+            if b.get("type", 0) == 0:
+                for ln in b["lines"]:
+                    bbs = [sp["bbox"] for sp in ln["spans"]]
+                    ln["bbox"] = (min(x[0] for x in bbs), min(x[1] for x in bbs), max(x[2] for x in bbs), max(x[3] for x in bbs))
+                bbs = [ln["bbox"] for ln in b["lines"]]
+                b["bbox"] = (min(x[0] for x in bbs), min(x[1] for x in bbs), max(x[2] for x in bbs), max(x[3] for x in bbs))
+    return raw
+
+
+def _absorb_fragments(blocks: list[dict]) -> None:
+    """양쪽 정렬로 글자 간격이 크게 벌어진 줄('M é r i d a ,')은 따로 떨어진 짧은 블록으로 읽힌다.
+    다른 문단 블록의 상자 안에 들어 있는 한 줄짜리 짧은 조각은 그 문단의 줄로 되돌린다."""
+    hosts = [b for b in blocks if b["kind"] in ("para", "note", "footnote") and b.get("lines")
+             and len(b["lines"]) >= 2 and b.get("bbox") is not None]
+    drop = []
+    for f in blocks:
+        if f in hosts or f["kind"] not in ("para", "note", "heading", "footnote") or not f.get("lines") \
+                or len(f["lines"]) != 1 or len(f["text"].strip()) > 40 or f.get("bbox") is None:
+            continue
+        c = pymupdf.Point((f["bbox"].x0 + f["bbox"].x1) / 2, (f["bbox"].y0 + f["bbox"].y1) / 2)
+        host = next((h for h in hosts if h is not f and h["bbox"].contains(c)
+                     and h["bbox"].y0 < c.y < h["bbox"].y1 - 1), None)
+        if host is None:
+            continue
+        host["lines"] = sorted(host["lines"] + f["lines"],
+                               key=lambda l: (round((l["bbox"].y0 + l["bbox"].y1) / 2 / 4), l["bbox"].x0))
+        h, p_ = join_lines(host["lines"])
+        host["html"], host["text"] = _protect(h), p_
+        drop.append(f)
+    for f in drop:
+        blocks.remove(f)
+
+
+def _unheader_column_tops(blocks: list[dict], body: float) -> None:
+    """위 여백이 좁은 PDF에서 '머리글 구역'에 들어온 본문 첫 줄을 되돌린다.
+    - 바로 아래(6pt 이내) 본문 블록과 글자 크기가 같은 줄 = 그 단의 첫 줄(앞 쪽에서 이어지는 참고문헌 등)
+    - 'REFERENCES' 같은 절 제목, 바로 아래 그림의 제목('Dimensions of Equity')
+    러닝 헤더는 보통 본문보다 작은 글씨이거나 본문과 간격이 있어 그대로 남는다."""
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if b["kind"] != "header" or b.get("noise") or not b.get("lines") or b.get("bbox") is None:
+                continue
+            t = b["text"].strip()
+            if DOWNLOAD_NOTICE_RE.search(t) or re.fullmatch(r"[\divxlcIVXLC\s.\-–]+", t):
+                continue
+            r = b["bbox"]
+            if REF_HEAD_RE.match(t) and b["size"] >= body * 0.95:
+                b["kind"] = "heading"
+                changed = True
+                continue
+            below = [o for o in blocks if o is not b and o.get("bbox") is not None and o["kind"] != "header"
+                     and 0 <= o["bbox"].y0 - r.y1 <= 22
+                     and min(o["bbox"].x1, r.x1) - max(o["bbox"].x0, r.x0) > 0.5 * min(r.width, o["bbox"].width)]
+            if not below:
+                continue
+            o = min(below, key=lambda x: x["bbox"].y0)
+            gap = o["bbox"].y0 - r.y1
+            if o["kind"] == "figure" and len(t) < 80 and b["size"] >= body * 0.95:
+                b["kind"] = "caption"              # 그림 바로 위 제목
+                changed = True
+            elif o["kind"] in ("para", "note", "reference", "list") and gap <= 8 \
+                    and abs(o["size"] - b["size"]) < 0.6 and b["size"] >= body * 0.95:
+                b["kind"] = o["kind"]
+                changed = True
+
+
 def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any]:
     """원문 페이지 1장 → {"mode", "body_size", "blocks"}.
 
@@ -968,7 +1172,12 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
            "image" : 가로로 돌려 앉힌 표처럼 글자 대부분이 회전된 페이지 → 원문을 그대로 넣는다
            "scan"  : 글자가 사진으로 된 스캔 쪽 → OCR(build_ocr_page) 후 "text"가 된다
     """
-    raw = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES)
+    raw = _drop_overprint(page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES))
+    if not _in_rotated:
+        try:
+            _mark_synthetic_italics(page, raw)
+        except Exception:
+            pass
     if _in_rotated:
         raw = _reocr_raw(page, raw) or raw
     elif _page_is_image_backed(page) and not is_scanned(page, raw):
@@ -1024,7 +1233,9 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
     for fi, f in enumerate(figs):
         for bbox, lines in block_lines:
             ht = " ".join(l["text"] for l in lines)
+            # 그림 안쪽에 들어 있는 글자(도형 속 이름표 'Access')는 머리글이 아니다: 그림 위끝에 걸친 줄만
             if bbox.y1 < max(62, H * 0.115) + 4 and bbox.intersects(f) and bbox.y1 < f.y0 + 30 \
+                    and bbox.y0 <= f.y0 + 3 \
                     and len(ht) < 100 and len(re.findall(r"[A-Za-z]", ht)) >= 3 and not NUMERIC_LABEL_RE.match(ht):
                 figs[fi] = pymupdf.Rect(f.x0, max(f.y0, bbox.y1 + 2), f.x1, f.y1)
                 f = figs[fi]
@@ -1116,6 +1327,9 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
                        "text": plain, "lines": lines, "centered": centered,
                        "title": kind == "heading" and size > body * 1.3})
 
+    _unheader_column_tops(blocks, body)
+    _absorb_fragments(blocks)
+
     # 작은 글씨라도 그 아래에 본문 문단이 있으면 각주가 아니다 (그림 옆 대화문, 표 주석 등)
     body_tops = [b["bbox"].y0 for b in blocks if b["kind"] == "para" and b["size"] >= body * 0.95]
     for b in blocks:
@@ -1126,6 +1340,12 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
             b["kind"] = "note"
 
     _fix_kinds(blocks, page.rect, body)
+    _promote_styled_headings(blocks, page.rect, body)
+    for b in blocks:                               # 기울임이 단어 중간에서 시작·끝나면(줄바꿈 하이픈) 단어 전체로
+        for k in ("html",):
+            if b.get(k) and "<i>" in b[k]:
+                b[k] = re.sub(r"(\w+)<i>(?=\w)", r"<i>\1", b[k])
+                b[k] = re.sub(r"(?<=\w)</i>(\w+)", r"\1</i>", b[k])
     if raw.get("_reocr"):
         # 획 굵기로 찾은 굵은 글씨: 여러 줄 본문 속 한 단어짜리는 잉크 번짐일 가능성이 커서 버린다
         for b in blocks:
@@ -1387,6 +1607,40 @@ def _figure_block(r: pymupdf.Rect, raw: dict, body: float, page: pymupdf.Page | 
     return blk
 
 
+def _promote_styled_headings(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None:
+    """서식만으로 구분되는 제목을 찾는다.
+    - 한 줄 전체가 이탤릭인 왼쪽 정렬 짧은 줄('Importance of Gaps Analyses for …', 'If Not “Gap” Analyses, Then What?')
+    - 본문보다 큰 굵은 글씨로 가운데 놓인 연속된 줄(두 줄로 나뉜 논문 제목) → 하나의 제목으로 합친다"""
+    whole = re.compile(r"^\s*<([ib])>[^<]*</\1>\s*$")
+    for b in blocks:
+        if b["kind"] not in ("para", "heading") or not b.get("lines") or len(b["lines"]) > 2 or b.get("bbox") is None:
+            continue
+        t, m = b["text"].strip(), whole.match(b.get("html") or "")
+        if not m or len(t) > 110 or len(t.split()) < 2 or t.endswith((".", ",", ";")):
+            continue
+        cx = (b["bbox"].x0 + b["bbox"].x1) / 2
+        centered = abs(cx - page_rect.width / 2) < 15 and b["bbox"].width < page_rect.width * 0.75
+        if m.group(1) == "i" and not centered and b["size"] >= body * 0.95 and _is_title_case(t) \
+                and b["kind"] == "para":
+            b["kind"] = "heading"
+        elif m.group(1) == "b" and centered and b["size"] > body * 1.1:
+            b["kind"] = "heading"
+            b["title"] = b["size"] > body * 1.15
+    # 연속된 큰 제목 줄은 하나로
+    i = 0
+    while i < len(blocks) - 1:
+        a, c = blocks[i], blocks[i + 1]
+        if a["kind"] == "heading" and c["kind"] == "heading" and a.get("title") and c.get("title") \
+                and a.get("bbox") is not None and c.get("bbox") is not None \
+                and 0 <= c["bbox"].y0 - a["bbox"].y1 < a["size"] * 0.8 and abs(a["size"] - c["size"]) < 0.5:
+            a["lines"] = (a.get("lines") or []) + (c.get("lines") or [])
+            h, p_ = join_lines(a["lines"])
+            a["html"], a["text"], a["bbox"] = _protect(h), p_, a["bbox"] | c["bbox"]
+            del blocks[i + 1]
+            continue
+        i += 1
+
+
 def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None:
     """글꼴 정보가 없거나 OCR로 블록이 잘게 나뉜 쪽에서 종류를 바로잡는다.
     - 쪽 위 머리글 구역에 걸린 '본문 폭의 줄'이 바로 아래 문단과 붙어 있으면 본문 (쪽 첫 줄)
@@ -1487,7 +1741,11 @@ def _merge_caption_tail(blocks: list[dict]) -> list[dict]:
 def _split_byline(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict]:
     """논문 제목 아래 저자·소속(가운데 정렬 짧은 줄들)은 줄마다 따로 둔다.
     OCR이 '이름 + 소속'을 한 블록으로 묶으면 번역이 'Ohio University Marjorie …'처럼 엉킨다."""
-    ti = next((i for i, b in enumerate(blocks) if b["kind"] == "heading" and b.get("title")), None)
+    W0 = page_rect.width
+    cands = [i for i, b in enumerate(blocks) if b["kind"] == "heading" and b.get("title")]
+    # 왼쪽 위 '연구 논평(Research Commentary)' 같은 꼭지 이름보다 가운데 놓인 논문 제목을 우선
+    centered_c = [i for i in cands if abs((blocks[i]["bbox"].x0 + blocks[i]["bbox"].x1) / 2 - W0 / 2) < 20]
+    ti = (centered_c or cands or [None])[0]
     if ti is None:
         return blocks
     out = blocks[: ti + 1]
@@ -1519,6 +1777,9 @@ def _split_byline(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict]:
         b = blocks[i]
         cx = (b["bbox"].x0 + b["bbox"].x1) / 2
         lines = b.get("lines") or []
+        if re.fullmatch(r"\s*(Abstract|ABSTRACT|Summary|SUMMARY|요약|초록)\s*", b.get("text", "")):
+            b["kind"] = "heading"                  # 가운데 놓인 'Abstract'는 저자 줄이 아니라 제목
+            break
         if b["kind"] in ("para", "heading", "note") and lines and abs(cx - W / 2) < 30 \
                 and all(len(l["text"]) < 70 for l in lines) and b["bbox"].width < W * 0.75:
             for l in lines:
@@ -1721,7 +1982,11 @@ def mark_references(pages: list[dict]) -> None:
             # 오른쪽 정렬 짧은 줄('Manuscript received …', 'Accepted …')은 항목에서 떼어 둔다
             right_x = max((l["bbox"].x1 for l in ref_lines if "bbox" in l), default=0)
             tail = [l for l in ref_lines if "bbox" in l and l["x0"] > margin + (right_x - margin) * 0.35
-                    and len(l["text"].strip()) < 60 and not AUTHOR_START_RE.match(l["text"].strip())]
+                    and len(l["text"].strip()) < 60 and not AUTHOR_START_RE.match(l["text"].strip())
+                    # 같은 높이에 다른 줄이 있으면 오른쪽 정렬 줄이 아니라 글자 간격이 벌어진 줄의 일부
+                    and not any(o is not l and "bbox" in o and min(o["bbox"].y1, l["bbox"].y1)
+                                - max(o["bbox"].y0, l["bbox"].y0) > 0.5 * (l["bbox"].y1 - l["bbox"].y0)
+                                for o in ref_lines)]
             ref_lines[:] = [l for l in ref_lines if l not in tail]
             # 번호식 참고문헌([1] … / 1. …)이면 번호로 시작하는 줄에서만 새 항목
             numbered_style = sum(bool(re.match(r"^\s*(\[\d+\]|\d+\.)\s", l["text"])) for l in ref_lines) \
@@ -1749,10 +2014,23 @@ def mark_references(pages: list[dict]) -> None:
         paras = [b for b in pg["blocks"] if b["kind"] in ("para", "note", "footnote") and b.get("bbox") is not None]
         mid = (min(b["bbox"].x0 for b in paras) + max(b["bbox"].x1 for b in paras)) / 2 if paras else 0
         right_edge = max((b["bbox"].x1 for b in paras), default=0)
+        # 2단이면 오른쪽 단의 왼쪽 여백 (내어쓰기한 둘째 줄을 '오른쪽 정렬 줄'로 오인하지 않도록)
+        big = [b for b in paras if len(b.get("lines") or []) >= 3 and b["bbox"].x0 >= mid - 10]
+        rcol = min((b["bbox"].x0 for b in big), default=mid)
+        # 작은 글씨라 각주로 분류된 'REFERENCES' 제목: 제목으로 바꾸고, 쪽 안에서 제자리(그 아래 본문 앞)로 옮긴다
+        for rb in [b for b in pg["blocks"] if b["kind"] in ("footnote", "note") and b.get("bbox") is not None
+                   and REF_HEAD_RE.match(b["text"].strip())]:
+            rb["kind"] = "heading"
+            pg["blocks"].remove(rb)
+            pos = next((i for i, o in enumerate(pg["blocks"]) if o["kind"] not in ("header", "meta")
+                        and o.get("bbox") is not None and o["bbox"].y0 >= rb["bbox"].y0 - 1
+                        and min(o["bbox"].x1, rb["bbox"].x1) > max(o["bbox"].x0, rb["bbox"].x0)), len(pg["blocks"]))
+            pg["blocks"].insert(pos, rb)
         for b in pg["blocks"]:
             # 오른쪽 정렬 짧은 줄('Manuscript received …')은 참고문헌 항목이 아니다
             if in_refs and b["kind"] in ("para", "note") and b.get("bbox") is not None \
                     and len(b.get("lines") or []) <= 2 and b["bbox"].x0 > mid + 20 \
+                    and b["bbox"].x0 > rcol + 40 \
                     and abs(b["bbox"].x1 - right_edge) < 6 and len(b["text"]) < 90 \
                     and not re.match(r"^[A-Z][A-Za-z'’\-]+,\s+[A-Z]\.", b["text"]):
                 flush()
@@ -1967,6 +2245,7 @@ def extract_document(doc: pymupdf.Document, progress=None, workers: int | None =
         rest = [b for b in pages[0]["blocks"] if b["kind"] != "meta"]
         heads = [b for b in rest if b["kind"] == "header"]
         pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
+    _mark_repeated_margins(pages)
     _restore_top_headings(pages)
     _assign_printed_numbers(pages)
     mark_references(pages)
@@ -2169,6 +2448,30 @@ def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0
 
 def _label_html(text: str) -> str:
     return f'<p style="text-align:right;color:#888;font-size:8pt;margin:0">{esc(text)}</p>'
+
+
+def _mark_repeated_margins(pages: list[dict]) -> None:
+    """여러 쪽의 같은 높이에 되풀이되는 짧은 줄(저널 이름·권호 꼬리글, 러닝 헤더)은 본문이 아니다.
+    머리글 구역 밖에 조금 걸쳐 제목·각주로 잘못 분류된 것을 머리글로 돌린다."""
+    from collections import defaultdict
+
+    def norm(t: str) -> str:
+        return re.sub(r"[\d\W_]+", "", t).lower()
+
+    if len([p for p in pages if p.get("mode") == "text"]) < 3:
+        return
+    seen: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for i, pg in enumerate(pages):
+        for b in pg.get("blocks", []):
+            if b.get("bbox") is not None and len(b.get("text", "")) < 120 and norm(b.get("text", "")):
+                seen[norm(b["text"])].append((i, b["bbox"].y0))
+    for pg_i, pg in enumerate(pages):
+        for b in pg.get("blocks", []):
+            if b["kind"] in ("heading", "para", "footnote", "note") and b.get("bbox") is not None \
+                    and len(b.get("text", "")) < 120 and norm(b.get("text", "")):
+                same = {i for i, y in seen[norm(b["text"])] if abs(y - b["bbox"].y0) <= 4}
+                if len(same) >= 3:
+                    b["kind"] = "header"
 
 
 def _restore_top_headings(pages: list[dict]) -> None:
