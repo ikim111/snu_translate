@@ -455,10 +455,22 @@ def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[st
         gloss = "\n  용어집(영어 → 번역어, 문맥에 맞게 일관되게 적용):\n" + "\n".join(
             f"  - {en} → {ko}" for en, ko in glossary_entries.items())
     instructions = SYSTEM_PROMPT.format(lang=LANG_NAME.get(target, target), glossary=gloss)
+    # 지시문이 요구하는 출력({"items": [{id, translation, status, review}]})과 같은 모양이어야 한다.
+    # (strict 스키마는 모델 출력 모양을 강제하므로, 여기가 지시문과 다르면 지시문은 무시된다)
     schema = {
         "type": "object",
-        "properties": {"translations": {"type": "array", "items": {"type": "string"}}},
-        "required": ["translations"],
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "translation": {"type": "string"},
+                "status": {"type": "string", "enum": ["ok", "needs_review"]},
+                "review": {"type": "string"},
+            },
+            "required": ["id", "translation", "status", "review"],
+            "additionalProperties": False,
+        }}},
+        "required": ["items"],
         "additionalProperties": False,
     }
 
@@ -652,12 +664,21 @@ def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
         out.append({"id": sg["id"], "translation": tr,
                     "status": o.get("status") if o.get("status") in ("ok", "needs_review") else "ok",
                     "review": o.get("review") or ""})
-    # 입력을 그대로 되돌려 준 응답(번역 안 됨)은 받지 않는다
+    # 입력을 그대로 되돌려 준 응답(번역 안 됨)은 받지 않는다.
+    # 단, 문헌 정보(저자·연도·Eds.·pp. 등)는 원문 그대로 두는 게 맞으므로 '되돌려 줌'으로 세지 않는다.
     same = sum(1 for sg, o in zip(segs, out) if o["translation"].strip() == sg["text"].strip() and
-               re.search(r"[A-Za-z]{4,}", sg["text"]))
+               re.search(r"[A-Za-z]{4,}", sg["text"]) and not _looks_bibliographic(sg["text"]))
     if same > max(1, len(segs) // 2):
         return None
     return out
+
+
+_BIB_RE = re.compile(r"\(\d{4}[a-z]?\)|\(Eds?\.\)|\bpp\.\s*\d|\bVol\.|\bJournal\b|\bPress\b|\b\d+\s*\(\d+\),\s*\d+")
+
+
+def _looks_bibliographic(text: str) -> bool:
+    """참고문헌·각주 문헌 정보처럼 보이는 조각(번역하지 않고 그대로 두는 것이 맞는 것)."""
+    return bool(_BIB_RE.search(text or ""))
 
 
 # ─────────────────────────── 용어 추천 (OpenAI) ───────────────────────────
