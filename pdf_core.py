@@ -1857,6 +1857,11 @@ def _gutter(blocks: list[dict], page_rect: pymupdf.Rect) -> float | None:
     body = [b for b in blocks if b["kind"] in ("para", "list", "heading", "dialogue", "reference", "note",
                                                "caption", "figure", "table")
             and not b["bbox"].is_empty and b["bbox"].width > 20]
+    if body:
+        # 본문이 쪽 가운데에 있지 않은 판형(왼쪽에 곁단)도 있으므로 본문 범위의 가운데를 기준으로
+        bx0, bx1 = min(b["bbox"].x0 for b in body), max(b["bbox"].x1 for b in body)
+        if abs((bx0 + bx1) / 2 - mid) > 30:
+            mid = (bx0 + bx1) / 2
     # 블록이 2개뿐이어도 좌우에 쪽 높이 절반이 넘는 긴 문단이 하나씩 있으면 2단 (그림이 한 단에 들어간 쪽)
     tall = [b for b in body if b["kind"] in ("para", "reference", "list") and b["bbox"].height > page_rect.height * 0.5]
     two_tall = len(tall) >= 2 and any(b["bbox"].x1 <= mid + 12 for b in tall) \
@@ -2698,7 +2703,8 @@ def _fit(html: list[tuple[str, pymupdf.Rect]], W: float, H: float, archive: pymu
         trial.close()
 
 
-def page_regions(blocks: list[dict], page_rect: pymupdf.Rect) -> list[tuple[pymupdf.Rect, list[dict]]]:
+def page_regions(blocks: list[dict], page_rect: pymupdf.Rect,
+                 left_limit: float = 0, right_limit: float = 1e9) -> list[tuple[pymupdf.Rect, list[dict]]]:
     """번역문을 놓을 영역들. 원문의 단 구성과 위치를 따른다.
     1단: 본문 전체를 하나의 상자에.
     2단: 위에서부터 '가로지르는 블록'은 전체 폭 상자, 그 사이 구간은 왼쪽 단·오른쪽 단 상자 두 개.
@@ -2707,12 +2713,38 @@ def page_regions(blocks: list[dict], page_rect: pymupdf.Rect) -> list[tuple[pymu
     body = [b for b in blocks if b["kind"] != "header"]
     if not body:
         return []
+    # 왼쪽 여백의 좁은 곁단(인용 강조·용어 설명 상자): 본문 단과 따로, 원래 자리에 둔다
+    wide = [b for b in body if not b["bbox"].is_empty and b["bbox"].width >= W * 0.22]
+    side: list[dict] = []
+    right_side = False
+    if wide:
+        main_x0 = min(b["bbox"].x0 for b in wide)
+        main_x1 = max(b["bbox"].x1 for b in wide)
+        cand = [b for b in body if not b["bbox"].is_empty and b["kind"] not in ("figure", "table")
+                and b["bbox"].width < W * 0.2]
+        side = [b for b in cand if b["bbox"].x1 <= main_x0 - 10]
+        if not side:
+            side = [b for b in cand if b["bbox"].x0 >= main_x1 + 10]
+            right_side = bool(side)
+        if sum(len(b.get("text", "")) for b in side) < 15:
+            side, right_side = [], False
+    if side:
+        y_top = max(52.0, min(b["bbox"].y0 for b in side) - 4)
+        if right_side:
+            side_r = pymupdf.Rect(max(b["bbox"].x1 for b in wide) + 8, y_top,
+                                  min(W - 20, max(b["bbox"].x1 for b in side) + 6), H - 28)
+            return page_regions([b for b in blocks if b not in side], page_rect, 0, side_r.x0 - 6) + \
+                [(side_r, sorted(side, key=lambda b: b["bbox"].y0))]
+        side_r = pymupdf.Rect(max(20, min(b["bbox"].x0 for b in side) - 6), y_top,
+                              min(b["bbox"].x0 for b in wide) - 8, H - 28)
+        return page_regions([b for b in blocks if b not in side], page_rect, side_r.x1 + 6) + \
+            [(side_r, sorted(side, key=lambda b: b["bbox"].y0))]
     placed = [b for b in body if not b["bbox"].is_empty]
     x0 = min((b["bbox"].x0 for b in placed), default=40)
     x1 = max((b["bbox"].x1 for b in placed), default=W - 40)
     # 한국어 줄이 조금 길어지므로 본문 폭을 좌우로 약간 넓힌다 (쪽 가장자리 28pt까지)
-    x0 = max(28, min(x0 - 6, 40))
-    x1 = min(W - 28, max(x1 + 6, W - 40))
+    x0 = max(28, min(x0 - 6, 40), left_limit)
+    x1 = min(W - 28, max(x1 + 6, W - 40), right_limit)
     top_y = min((b["bbox"].y0 for b in placed), default=60)
     top = max(52.0, top_y - 30)
     bottom = H - 28
