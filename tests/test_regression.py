@@ -1,10 +1,11 @@
 """회귀 검사 — 실제 논문 PDF로 추출·구조를 확인한다 (번역 API는 쓰지 않음).
 
 논문 PDF는 저작권 때문에 저장소에 넣지 않는다. 내 컴퓨터에 있는 파일 경로를 환경 변수로 주면 실행된다.
-    STEIN_PDF=…/Stein_Grover_Henningsen1996….pdf BEHRENS_PDF=…/Behrens1997….pdf python -m pytest tests -q
+    STEIN_PDF=…/Stein….pdf BEHRENS_PDF=…/Behrens1997….pdf FRAMING_PDF=…/Gutiérrez2009 Framing Equity.pdf python -m pytest tests -q
 경로가 없으면 해당 검사는 건너뛴다. 단위 검사(맨 아래)는 항상 실행된다.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,11 @@ def stein():
 @pytest.fixture(scope="module")
 def behrens():
     return _load("BEHRENS_PDF")
+
+
+@pytest.fixture(scope="module")
+def framing():
+    return _load("FRAMING_PDF")          # Gutiérrez (2009) Framing Equity — 겹쳐 찍은 글자, 기울여 그린 이탤릭
 
 
 def kinds(pg, k):
@@ -155,3 +161,36 @@ def test_apply_scan_check():
 def test_split_joined():
     assert c._split_joined("vehiclesfor", {"vehicles", "for"}) == 8
     assert c._split_joined("building", {"building"}) is None
+
+
+def test_framing_equity(framing):
+    d, pages = framing
+    allt = [b["text"] for pg in pages for b in pg["blocks"]]
+    # 겹쳐 찍은 제목·초록이 한 번씩만
+    p1 = pages[0]["blocks"]
+    assert sum("Framing Equity" in b["text"] for b in p1) == 1
+    assert sum(b["text"].strip() == "Abstract" for b in p1) == 1
+    assert not any("Rochelle Gutiérrez Rochelle" in t for t in allt)
+    # 2쪽: 위쪽 제목 + 좌우 2단
+    assert any(b["kind"] == "heading" and "Framing Equity" in b["text"] for b in pages[1]["blocks"])
+    assert c._gutter(pages[1]["blocks"], d[1].rect) is not None
+    # 3쪽: 도식 전체(위 타원 포함), 도식 제목, 2단
+    fig = kinds(pages[2], "figure")[0]
+    assert fig["bbox"].y0 < 70 and fig["bbox"].y1 > 160
+    assert any(b["kind"] == "caption" and "Dimensions of Equity" in b["text"] for b in pages[2]["blocks"])
+    assert c._gutter(pages[2]["blocks"], d[2].rect) is not None
+    # 4쪽: 단 맨 위 참고문헌 첫 줄이 버려지지 않음
+    refs = [b["text"] for b in kinds(pages[3], "reference")]
+    assert any(t.startswith("Abreu") and "valorization" in t for t in refs)
+    assert any(t.startswith("Gutstein") and "Reading and writing the world" in t for t in refs)
+    assert any("Mérida" in t for t in refs)
+    # 5쪽: 제목, 질문은 참고문헌이 아니라 번역할 본문, 7번 기울임
+    p5 = pages[4]["blocks"]
+    assert any(b["kind"] == "heading" and "Post" in b["text"] for b in p5)
+    qs = [b for b in p5 if re.match(r"\d\.", b["text"])]
+    assert len(qs) == 8 and all(b["kind"] == "para" for b in qs)
+    assert "<i>make note of the ways" in qs[6]["html"]
+    # 2쪽 기울임·밑줄 강조
+    h2 = " ".join(b.get("html") or "" for b in pages[1]["blocks"])
+    for w in ("Access", "Achievement", "Identity", "past"):
+        assert f"<i>{w}</i>" in h2

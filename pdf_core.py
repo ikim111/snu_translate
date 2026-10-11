@@ -208,6 +208,8 @@ def join_lines(lines: list[dict]) -> tuple[str, str]:
     if "<i>" in html:                           # 기울임이 단어 중간(줄바꿈 하이픈 자리)에서 시작·끝나면 단어 전체로
         html = re.sub(r"(\w+)<i>(?=\w)", r"<i>\1", html)
         html = re.sub(r"(?<=\w)</i>(\w+)", r"\1</i>", html)
+        # 기울임 구절 사이의 짧은 낱말(of, in, the)은 너무 짧아 따로 판정하지 못한다 → 앞뒤가 기울임이면 같이
+        html = re.sub(r"</i>(\s+[A-Za-z]{1,3}\s+)<i>", r"\1", html)
     return html, plain
 
 
@@ -1853,12 +1855,14 @@ def _gutter(blocks: list[dict], page_rect: pymupdf.Rect) -> float | None:
             and not b["bbox"].is_empty and b["bbox"].width > 20]
     # 블록이 2개뿐이어도 좌우에 쪽 높이 절반이 넘는 긴 문단이 하나씩 있으면 2단 (그림이 한 단에 들어간 쪽)
     tall = [b for b in body if b["kind"] in ("para", "reference", "list") and b["bbox"].height > page_rect.height * 0.5]
-    if len(body) < 3 and not (len(tall) >= 2 and any(b["bbox"].x1 <= mid + 12 for b in tall)
-                              and any(b["bbox"].x0 >= mid - 12 for b in tall)):
+    two_tall = len(tall) >= 2 and any(b["bbox"].x1 <= mid + 12 for b in tall) \
+        and any(b["bbox"].x0 >= mid - 12 for b in tall)
+    if len(body) < 3 and not two_tall:
         return None
     left = [b for b in body if b["bbox"].x1 <= mid + 12]
     right = [b for b in body if b["bbox"].x0 >= mid - 12]
-    if not left or not right or len(left) + len(right) < len(body) * 0.6:
+    # 좌우에 긴 문단이 하나씩 있으면 2단 (위쪽 전체 폭 제목·가운데 저자 줄이 많아 비율이 낮아도)
+    if not two_tall and (not left or not right or len(left) + len(right) < len(body) * 0.6):
         return None
     lx1 = max(b["bbox"].x1 for b in left)
     rx0 = min(b["bbox"].x0 for b in right)
@@ -2058,8 +2062,8 @@ def mark_references(pages: list[dict]) -> None:
                 in_refs = False
             if in_refs and b["kind"] == "heading" and AUTHOR_START_RE.match(b["text"].strip()) and b.get("lines"):
                 b["kind"] = "para"                 # 굵게 읽힌 첫 참고문헌 항목
-            elif in_refs and b["kind"] == "heading" and len(b["text"].strip()) < 60 \
-                    and not re.search(r"[,&(\d]|[-.]$", b["text"].strip()):
+            elif in_refs and b["kind"] == "heading" and len(b["text"].strip()) < 120 \
+                    and not re.search(r"\(\d|\d{4}|,|&|[-.]$", b["text"].strip()):
                 flush()                            # 참고문헌 뒤의 새 절('Post-Reading Questions', 'Author')
                 in_refs = False
             if in_refs and b["kind"] in ("para", "footnote", "note", "list") and b.get("lines"):
@@ -2151,7 +2155,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-11d"
+EXTRACT_VERSION = "2026-10-11e"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
