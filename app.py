@@ -39,7 +39,8 @@ def _reload_changed_modules() -> None:
         mod = sys.modules.get(name)
         if mod is None or not getattr(mod, "__file__", None):
             continue
-        if os.path.getmtime(mod.__file__) > getattr(mod, "_loaded_at", 0):
+        loaded = mod.__dict__.setdefault("_loaded_at", time.time())   # 처음 본 모듈은 지금 불러온 것으로
+        if os.path.getmtime(mod.__file__) > loaded:
             mod = importlib.reload(mod)
             mod._loaded_at = time.time()
 
@@ -269,6 +270,30 @@ def save_cache(key: str, data: dict[str, Any]) -> None:
         pass   # 디스크 캐시 실패해도 session_state에는 남아 있다
 
 
+def _progress_path(key: str) -> str:
+    return f"progress/{hashlib.md5(key.encode()).hexdigest()}.json"
+
+
+def load_remote_progress(key: str) -> dict[str, Any]:
+    """서버가 다시 시작되면 디스크 캐시가 사라질 수 있다 → 서재(비공개 저장소)에 둔 진행 상황을 불러온다."""
+    if lib is None:
+        return {}
+    try:
+        b = lib.read(_progress_path(key))
+        return json.loads(b.decode("utf-8")) if b else {}
+    except Exception:
+        return {}
+
+
+def save_remote_progress(key: str, data: dict[str, Any]) -> None:
+    if lib is None:
+        return
+    try:
+        lib.write(_progress_path(key), json.dumps(data, ensure_ascii=False).encode("utf-8"), "번역 진행 상황 저장")
+    except Exception:
+        pass
+
+
 # ─────────────────────────── 메인 화면 ───────────────────────────
 st.title("📄 논문 정독용 번역기")
 st.caption("원문 1쪽 = 번역 1쪽. 그림·표는 원문 그대로, 이탤릭은 볼드로 표시됩니다.")
@@ -441,7 +466,7 @@ opts_sig = hashlib.md5(json.dumps([engine_name, model, target, translate_refs, t
 cache_key = f"{Path(uploaded.name).stem[:40]}_{pdf_hash[:16]}_{opts_sig}"
 if st.session_state.get("cache_key") != cache_key:
     st.session_state.cache_key = cache_key
-    st.session_state.cache = load_cache(cache_key)
+    st.session_state.cache = load_cache(cache_key) or load_remote_progress(cache_key)
     st.session_state.pop("built", None)
     st.session_state.lib_meta = None
     # 서버 캐시가 비었으면(앱이 잠들었다 깨어난 경우 등) 서재에 보관된 번역을 불러온다 → 번역비 없음
@@ -723,6 +748,7 @@ def run_translation(targets: list[dict]) -> None:
         futures = {pool.submit(translate_page, engine, pg, pages, pngs[pg["page_number"]], scan_store,
                                units_sig(pg)): pg for pg in targets}
         status.write(f"번역 중… 0 / {len(targets)}쪽")
+        done_now = 0
         for fut in as_completed(futures):
             pg = futures[fut]
             pno = pg["page_number"]
@@ -732,6 +758,9 @@ def run_translation(targets: list[dict]) -> None:
                                    "pv": engines.PROMPT_VERSION if engine_name == "OpenAI" else "",
                                    "original": core.page_text(pg, translated=False)}
                 save_cache(cache_key, cache)
+                done_now += 1
+                if done_now % 10 == 0:          # 10쪽마다 서재에도 저장 (서버가 멈춰도 돈 쓴 번역은 남게)
+                    save_remote_progress(cache_key, cache)
             except engines.EngineError as e:
                 failures[pno] = str(e)
                 if e.fatal and fatal is None:
@@ -754,6 +783,7 @@ def run_translation(targets: list[dict]) -> None:
     if failures:
         st.info("다시 누르면 남은 페이지부터 이어서 번역합니다.")
     st.session_state.pop("built", None)
+    save_remote_progress(cache_key, cache)
     st.session_state.autosave = True          # 아래에서 PDF를 만든 뒤 서재에 저장
 
 
@@ -825,7 +855,21 @@ def translated_page(pg: dict) -> dict | None:
 
 
 def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
+    # 쪽마다 한글 글꼴 전체가 새로 들어가 메모리가 쪽 수에 비례해 커진다(112쪽 → 2.6GB, 서버가 멈춤).
+    # 8쪽씩 따로 만들어 글꼴을 줄인 뒤 합친다 (같은 문서가 약 350MB).
+    import gc
+    final = pymupdf.open()
     out = pymupdf.open()
+
+    def flush_chunk() -> None:
+        nonlocal out
+        if out.page_count:
+            out.subset_fonts()
+            final.insert_pdf(pymupdf.open("pdf", out.tobytes(garbage=3, deflate=True)))
+        out.close()
+        out = pymupdf.open()
+        gc.collect()
+
     txt: list[str] = []
     md: list[str] = [f"# {Path(uploaded.name).stem}\n"]
     plist = sel if page_list is None else page_list
@@ -855,6 +899,10 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
         orig = core.page_text(pg, translated=False)
         txt.append(f"──────────── Page {pno} ────────────\n\n{body}\n")
         md.append(f"# Page {pno}\n\n## Translation\n\n{body}\n\n## Original\n\n{orig}\n")
+        if out.page_count >= 8:
+            flush_chunk()
+    flush_chunk()
+    out = final
     # 책갈피(절 제목)와 문서 정보. 번역 쪽만 쓴다 (쪽 순서 = 출력 PDF 쪽 순서일 때)
     if not interleave and all(tpgs.get(pg["page_number"]) is not None for pg in plist):
         try:
@@ -863,8 +911,7 @@ def build_outputs(page_list: list[dict] | None = None) -> dict[str, bytes]:
             pass
     out.set_metadata({"title": f"{Path(uploaded.name).stem} (한국어 번역)", "creator": "snu_translate",
                       "producer": "PyMuPDF"})
-    out.subset_fonts()
-    pdf = out.tobytes(garbage=4, deflate=True)
+    pdf = out.tobytes(garbage=3, deflate=True)
     reviews = {pg["page_number"]: list((cache.get(str(pg["page_number"])) or {}).get("review", [])) for pg in plist}
     # 쪽 경계 문장이 양쪽에 겹쳐 번역된 곳을 찾아 검토 목록에 올린다
     for pno, dup in core.boundary_overlaps([t for t in tpgs.values() if t is not None]):
