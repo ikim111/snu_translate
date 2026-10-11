@@ -1753,6 +1753,10 @@ def _split_byline(blocks: list[dict], page_rect: pymupdf.Rect) -> list[dict]:
     ti = (centered_c or cands or [None])[0]
     if ti is None:
         return blocks
+    for i in cands:                                # 제목 앞의 왼쪽 꼭지 이름('Research Commentary')은 작은 소제목으로
+        if i < ti and i not in centered_c:
+            blocks[i]["title"] = False
+            blocks[i]["kicker"] = True
     out = blocks[: ti + 1]
     i = ti + 1
     W = page_rect.width
@@ -2155,7 +2159,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-11e"
+EXTRACT_VERSION = "2026-10-11f"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
@@ -2402,11 +2406,14 @@ def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0
             continue
         tr = b.get("tr", b["html"])
         if k == "heading":
+            # 제목 전체가 기울임이면 강조가 아니라 서식 → 굵게+밑줄로 바꾸지 않는다
+            whole_i = bool(re.fullmatch(r"\s*<i>.*</i>\s*", tr or "", re.S)) and tr.count("<i>") == 1
+            rh = to_reading_html(tr, italic_to_bold=not whole_i)
             if b.get("title"):
-                out.append(f'<h1>{to_reading_html(tr)}</h1>')
+                out.append(f'<h1>{rh}</h1>')
             else:
                 tag = "h2" if (b["text"].isupper() or b.get("centered")) else "h3"
-                out.append(f"<{tag}>{to_reading_html(tr)}</{tag}>")
+                out.append(f"<{tag}>{rh}</{tag}>")
         elif k == "para":
             cls = "" if b.get("no_indent") else "para"
             if b.get("centered"):
@@ -2421,7 +2428,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0
                 cls = "right"
             elif b.get("item"):
                 cls = "item"
-            out.append(f'<p class="{cls}">{to_reading_html(tr)}</p>')
+            # 저자·소속 줄의 기울임은 서식이므로 굵게+밑줄로 바꾸지 않는다
+            out.append(f'<p class="{cls}">{to_reading_html(tr, italic_to_bold=not b.get("byline"))}</p>')
         elif k == "list":
             items = b.get("tr_items") or b["items"]
             out.append("<ul>" + "".join(f"<li>{to_reading_html(t)}</li>" for t in items) + "</ul>")
