@@ -27,6 +27,25 @@ import engines
 import library
 import pdf_core as core
 
+
+def _reload_changed_modules() -> None:
+    """배포 서버는 app.py만 다시 실행하고, 이미 불러온 모듈(pdf_core, engines …)은 옛 코드를 그대로 쓸 수 있다.
+    파일이 바뀐 모듈은 다시 불러와 app.py와 같은 버전을 쓰게 한다 (의존 순서대로)."""
+    import importlib
+    import os
+    import sys
+    import time
+    for name in ("text_table", "rotated_table", "library", "pdf_core", "engines"):
+        mod = sys.modules.get(name)
+        if mod is None or not getattr(mod, "__file__", None):
+            continue
+        if os.path.getmtime(mod.__file__) > getattr(mod, "_loaded_at", 0):
+            mod = importlib.reload(mod)
+            mod._loaded_at = time.time()
+
+
+_reload_changed_modules()
+
 # ─────────────────────────── 설정 ───────────────────────────
 CACHE_DIR = Path(".translation_cache")
 TARGETS = {"한국어 (KO)": "KO", "영어 (EN-US)": "EN-US"}
