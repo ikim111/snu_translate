@@ -519,6 +519,12 @@ def make_openai(api_key: str, model: str, target: str, glossary_entries: dict[st
             return call(segs, extra + "\n\n출력은 반드시 {\"items\": [{\"id\", \"translation\", \"status\", "
                                       "\"review\"}]} 형식의 JSON 하나여야 한다. [형식 재요청]")
         if out is None:
+            # 형식은 맞는데 원문을 되돌려 준 것으로만 판정된 경우: 쪽 전체를 실패시키지 않고 검토 표시로 받는다
+            loose = _parse_items(raw_text, segs, allow_echo=True)
+            if loose is not None:
+                return [dict(o, status="needs_review",
+                             review=(o.get("review") or "") + " [자동 검사: 원문과 같은 번역 — 확인 필요]")
+                        if o["translation"].strip() == sg["text"].strip() else o for sg, o in zip(segs, loose)]
             raise EngineError(f"번역 결과 형식 오류 — 받은 내용 앞부분: {raw_text[:160]!r}")
         return out
 
@@ -615,7 +621,7 @@ def unwrap_translation(t: str) -> str:
     return t
 
 
-def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
+def _parse_items(text: str, segs: list[dict], allow_echo: bool = False) -> list[dict] | None:
     """번역 응답 → 입력 조각 순서의 [{id, translation, status, review}].
     정해진 형식({"items": [...]})을 어긴 응답도 알아볼 수 있으면 받아 준다
     (다른 키 이름, 목록만 반환, translation 대신 text 등). 짝이 안 맞으면 None."""
@@ -667,10 +673,23 @@ def _parse_items(text: str, segs: list[dict]) -> list[dict] | None:
     # 입력을 그대로 되돌려 준 응답(번역 안 됨)은 받지 않는다.
     # 단, 문헌 정보(저자·연도·Eds.·pp. 등)는 원문 그대로 두는 게 맞으므로 '되돌려 줌'으로 세지 않는다.
     same = sum(1 for sg, o in zip(segs, out) if o["translation"].strip() == sg["text"].strip() and
-               re.search(r"[A-Za-z]{4,}", sg["text"]) and not _looks_bibliographic(sg["text"]))
-    if same > max(1, len(segs) // 2):
+               _looks_prose(sg["text"]))
+    if same > max(1, len(segs) // 2) and not allow_echo:
         return None
     return out
+
+
+_FUNC_WORDS = {"the", "of", "and", "to", "in", "that", "is", "for", "with", "as", "are", "this", "we", "it"}
+
+
+def _looks_prose(text: str) -> bool:
+    """영어 문장(번역해야 할 본문)처럼 보이는지. 이름·소속·주소·이메일·문헌 정보처럼
+    원문 그대로 두는 것이 맞는 줄은 '번역 안 됨' 검사에서 뺀다."""
+    plain_t = re.sub(r"<[^>]+>", " ", text or "")
+    if "@" in plain_t or _looks_bibliographic(plain_t):
+        return False
+    words = re.findall(r"[A-Za-z]+", plain_t)
+    return len(words) >= 8 and sum(w.lower() in _FUNC_WORDS for w in words) >= 2
 
 
 _BIB_RE = re.compile(r"\(\d{4}[a-z]?\)|\(Eds?\.\)|\bpp\.\s*\d|\bVol\.|\bJournal\b|\bPress\b|\b\d+\s*\(\d+\),\s*\d+")
