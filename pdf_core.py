@@ -427,11 +427,38 @@ def _figure_regions(page: pymupdf.Page, raw: dict) -> list[pymupdf.Rect]:
             ink = []
         rects += anchored + ink        # 겹치는 것은 아래에서 하나로 합쳐진다
     area = page.rect.width * page.rect.height
+    small: list[pymupdf.Rect] = []
     for b in raw["blocks"]:
         if b["type"] == 1:
             r = pymupdf.Rect(b["bbox"])
             if r.width >= MIN_FIG[0] and r.height >= MIN_FIG[1] and r.width * r.height < area * 0.8:
                 rects.append(r)
+            elif r.width >= 4 and r.height >= 4:
+                small.append(r)
+    # 작은 그림 여러 개로 이루어진 그림(그림그래프의 기타·사람 아이콘 등): 가까운 것끼리 묶어 크면 그림으로
+    if len(small) >= 4:
+        groups: list[pymupdf.Rect] = []
+        for r in small:
+            for k, g in enumerate(groups):
+                if (g + (-20, -20, 20, 20)).intersects(r):
+                    groups[k] = g | r
+                    break
+            else:
+                groups.append(pymupdf.Rect(r))
+        merged_any = True
+        while merged_any:
+            merged_any = False
+            for i in range(len(groups)):
+                for j in range(i + 1, len(groups)):
+                    if (groups[i] + (-20, -20, 20, 20)).intersects(groups[j]):
+                        groups[i] = groups[i] | groups[j]
+                        del groups[j]
+                        merged_any = True
+                        break
+                if merged_any:
+                    break
+        # 아이콘 한 줄(세로 막대)은 폭이 좁아도 넣는다 — 나란한 막대들은 아래에서 하나로 합쳐진다
+        rects += [g for g in groups if g.width >= MIN_FIG[0] or g.height >= MIN_FIG[1] * 2]
     try:
         page_area = page.rect.width * page.rect.height
         drawings = [
@@ -1108,6 +1135,49 @@ def _drop_overprint(raw: dict, tol: float = 1.0) -> dict:
     return raw
 
 
+def numeric_blocks_to_figures(blocks: list[dict]) -> None:
+    """숫자만 늘어선 블록(줄기와 잎 그림, 자료 목록, 그래프 눈금)은 번역할 글이 아니라 그림이다 → 원문을 그대로 잘라 넣는다.
+    글로 두면 숫자가 한 문단으로 이어 붙어 그림 모양이 사라진다."""
+    for b in blocks:
+        if b["kind"] not in ("para", "note") or b.get("bbox") is None:
+            continue
+        t = b.get("text", "")
+        core = re.sub(r"\s", "", t)
+        if len(core) >= 12 and sum(ch.isdigit() or ch in ".,|-–" for ch in core) / len(core) > 0.85:
+            b["kind"] = "figure"
+            b.setdefault("items", [])
+            b.setdefault("item_boxes", [])
+
+
+def _merge_numeric_figures(blocks: list[dict]) -> list[dict]:
+    """숫자 블록에서 생긴 그림 조각과 그 사이의 짧은 숫자 조각('1')을 하나의 그림으로 합친다."""
+    figs = [b for b in blocks if b["kind"] == "figure" and not b.get("img_name") and b.get("text")]
+    if len(figs) < 1:
+        return blocks
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if b["kind"] not in ("para", "note", "figure") or b.get("bbox") is None:
+                continue
+            for f in figs:
+                if f is b or f not in blocks:
+                    continue
+                short_num = b["kind"] != "figure" and re.fullmatch(r"[\d\s.,|]{1,8}", b.get("text", "") or "")
+                if (b["kind"] == "figure" and b.get("text") or short_num) and \
+                        (f["bbox"] + (-6, -8, 6, 8)).intersects(b["bbox"]):
+                    f["bbox"] = f["bbox"] | b["bbox"]
+                    f["text"] = (f["text"] + " " + b.get("text", "")).strip()
+                    blocks = [x for x in blocks if x is not b]
+                    if b in figs:
+                        figs.remove(b)
+                    changed = True
+                    break
+            if changed:
+                break
+    return blocks
+
+
 def _absorb_fragments(blocks: list[dict]) -> None:
     """양쪽 정렬로 글자 간격이 크게 벌어진 줄('M é r i d a ,')은 따로 떨어진 짧은 블록으로 읽힌다.
     다른 문단 블록의 상자 안에 들어 있는 한 줄짜리 짧은 조각은 그 문단의 줄로 되돌린다."""
@@ -1334,6 +1404,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
 
     _unheader_column_tops(blocks, body)
     _absorb_fragments(blocks)
+    numeric_blocks_to_figures(blocks)
 
     # 작은 글씨라도 그 아래에 본문 문단이 있으면 각주가 아니다 (그림 옆 대화문, 표 주석 등)
     body_tops = [b["bbox"].y0 for b in blocks if b["kind"] == "para" and b["size"] >= body * 0.95]
@@ -1361,6 +1432,8 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
                 b["html"] = re.sub(r"</?b>", "", b["html"])
     ordered = sort_reading_order(blocks, page.rect)
     ordered = _merge_continuations(ordered)
+    numeric_blocks_to_figures(ordered)
+    ordered = _merge_numeric_figures(ordered)
     _carry_across_columns(ordered, page.rect)
     ordered = _merge_caption_tail(_merge_headings(ordered))
     if raw.get("_reocr"):
@@ -1857,10 +1930,11 @@ def _gutter(blocks: list[dict], page_rect: pymupdf.Rect) -> float | None:
     body = [b for b in blocks if b["kind"] in ("para", "list", "heading", "dialogue", "reference", "note",
                                                "caption", "figure", "table")
             and not b["bbox"].is_empty and b["bbox"].width > 20]
-    if body:
-        # 본문이 쪽 가운데에 있지 않은 판형(왼쪽에 곁단)도 있으므로 본문 범위의 가운데를 기준으로
-        bx0, bx1 = min(b["bbox"].x0 for b in body), max(b["bbox"].x1 for b in body)
-        if abs((bx0 + bx1) / 2 - mid) > 30:
+    paras = [b for b in body if b["kind"] in ("para", "list", "reference")]
+    if paras:
+        # 본문이 쪽 가운데에 있지 않은 판형(한쪽에 곁단·큰 제목)도 있으므로 문단 범위의 가운데를 기준으로
+        bx0, bx1 = min(b["bbox"].x0 for b in paras), max(b["bbox"].x1 for b in paras)
+        if abs((bx0 + bx1) / 2 - mid) > 12:
             mid = (bx0 + bx1) / 2
     # 블록이 2개뿐이어도 좌우에 쪽 높이 절반이 넘는 긴 문단이 하나씩 있으면 2단 (그림이 한 단에 들어간 쪽)
     tall = [b for b in body if b["kind"] in ("para", "reference", "list") and b["bbox"].height > page_rect.height * 0.5]
