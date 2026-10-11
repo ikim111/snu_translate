@@ -1152,13 +1152,16 @@ def _unheader_column_tops(blocks: list[dict], body: float) -> None:
             below = [o for o in blocks if o is not b and o.get("bbox") is not None and o["kind"] != "header"
                      and 0 <= o["bbox"].y0 - r.y1 <= 22
                      and min(o["bbox"].x1, r.x1) - max(o["bbox"].x0, r.x0) > 0.5 * min(r.width, o["bbox"].width)]
-            if not below:
-                continue
-            o = min(below, key=lambda x: x["bbox"].y0)
-            gap = o["bbox"].y0 - r.y1
-            if o["kind"] == "figure" and len(t) < 80 and b["size"] >= body * 0.95:
+            o = min(below, key=lambda x: x["bbox"].y0) if below else None
+            gap = o["bbox"].y0 - r.y1 if o else 1e9
+            if o is not None and o["kind"] == "figure" and len(t) < 80 and b["size"] >= body * 0.95:
                 b["kind"] = "caption"              # 그림 바로 위 제목
                 changed = True
+            elif b["size"] >= body * 1.15 and len(t) >= 12 and re.search(r"[A-Za-z]{3}", t):
+                b["kind"] = "heading"              # 본문보다 큰 글씨 = 쪽 위 제목(러닝 헤더는 작은 글씨)
+                changed = True
+            elif o is None:
+                continue
             elif o["kind"] in ("para", "note", "reference", "list") and gap <= 8 \
                     and abs(o["size"] - b["size"]) < 0.6 and b["size"] >= body * 0.95:
                 b["kind"] = o["kind"]
@@ -2003,6 +2006,10 @@ def mark_references(pages: list[dict]) -> None:
                 entries[-1].append(ln)
             for e in entries:
                 h, p = join_lines(e)
+                # 양쪽 정렬로 글자 사이가 벌어진 단어('M é r i d a ,') → 'Mérida,'
+                spaced = re.compile(r"(?<!\S)(?:\w [\w,.]? ?){3,}\w[,.]?(?!\S)")
+                h = spaced.sub(lambda m: m.group(0).replace(" ", ""), h)
+                p = spaced.sub(lambda m: m.group(0).replace(" ", ""), p)
                 r = pymupdf.Rect()
                 for ln in e:
                     if "bbox" in ln:
@@ -2144,7 +2151,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-11c"
+EXTRACT_VERSION = "2026-10-11d"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
