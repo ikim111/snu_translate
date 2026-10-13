@@ -432,6 +432,20 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
         out.append([r, plain_row])
     grid = [r for r, _ in out]
 
+    # 칸 합치기로 쓰이지 않게 된 줄 조각은 번역 단위에서 뺀다 (번호를 다시 매긴다)
+    used = sorted({i for r in grid for cell in r for i in cell} | {i for i in header if i is not None}
+                  | set(title_idx) | ({sup} if sup is not None else set())
+                  | {i for i, _ in (group_row or []) if i is not None})
+    if len(used) < len(items):
+        remap = {o: n for n, o in enumerate(used)}
+        items = [items[i] for i in used]
+        texts = [texts[i] for i in used]
+        grid = [[[remap[i] for i in cell] for cell in r] for r in grid]
+        header = [remap[i] if i is not None else None for i in header]
+        title_idx = [remap[i] for i in title_idx]
+        sup = remap[sup] if sup is not None else None
+        group_row = [(remap[i] if i is not None else None, n) for i, n in group_row] if group_row else group_row
+
     all_cells = [c for r in rows for c in r] + list(super_rows or [])
     x0 = min(c["bbox"].x0 for c in all_cells)
     x1 = max(c["bbox"].x1 for c in all_cells)
