@@ -233,9 +233,10 @@ if "glossary_pending" in st.session_state:        # 추천 용어를 확정했�
 
 with st.sidebar:
     st.header("용어집")
-    glossary_text = st.text_area("영어 = 한국어 (한 줄에 하나)", key="glossary_text", height=160,
+    glossary_text = st.text_area("영어 = 한국어 (한 줄에 하나)", key="glossary_text", height=360,
                                  help="같은 용어를 논문 전체에서 같은 번역어로 맞춥니다. 한국어 번역에만 적용됩니다. "
                                       "용어집을 바꾸면 같은 논문도 다시 번역합니다.")
+    st.caption(f"용어 {len(parse_glossary(glossary_text))}개 · 개수·글자 수 제한 없음 (칸 안에서 스크롤)")
     if lib is not None and st.button("💾 용어집 서재에 저장", width="stretch"):
         try:
             lib.save_glossary(parse_glossary(glossary_text))
