@@ -246,7 +246,10 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
     texts: list[str] = []
     ids: list[int] = []
 
+    boxes: list = []
+
     def add(c: dict) -> int:
+        boxes.append((c["bbox"], c.get("size", 9)))
         items.append(c["html"].strip())
         texts.append(c["text"].strip())
         ids.append(c["id"])
@@ -374,6 +377,60 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
             pending = []
         merged.append(r)
     grid = merged
+
+    # 한 칸 안에서 여러 줄로 이어지는 글('• Communicate math-' / 'ematical ideas', 'Perform' / 'procedures/solve'):
+    # 같은 열 바로 아랫줄이 소문자로 시작하거나 윗줄이 '-' ',' '/'로 끝나고 줄 간격이 좁으면 한 칸으로 합친다.
+    # (칸마다 따로 번역하면 'ematical ideas' 같은 조각이 된다)
+    def bullet(t: str) -> bool:
+        return t[:1] in "•·▪–-*" if t else False
+    for c in range(ncol):
+        k = 0
+        while k < len(grid):
+            cell = grid[k][c]
+            if not cell or cell[-1] >= len(boxes):
+                k += 1
+                continue
+            j = k + 1
+            while j < len(grid) and len(grid[j][c]) == 1 and grid[j][c][0] < len(boxes):
+                a, b = cell[-1], grid[j][c][0]
+                ta, tb = texts[a].rstrip(), texts[b].lstrip()
+                gap = boxes[b][0].y0 - boxes[a][0].y1
+                cont = (tb[:1].islower() or ta.endswith(("-", ",", "/"))) and not bullet(tb) \
+                    and gap <= boxes[a][1] * 0.6 and (len(ta) >= 6 or ta.endswith("-"))
+                if not cont:
+                    break
+                if ta.endswith("-") and tb[:1].islower():
+                    items[a] = items[a].rstrip()[:-1] + items[b].lstrip()
+                    texts[a] = ta[:-1] + tb
+                else:
+                    items[a] = items[a].rstrip() + " " + items[b].lstrip()
+                    texts[a] = ta + " " + tb
+                boxes[a] = (boxes[a][0] | boxes[b][0], boxes[a][1])
+                grid[j][c] = []
+                j += 1
+            k = j if j > k + 1 else k + 1
+    grid = [r for r in grid if any(r)]
+
+    def ids_of(r):
+        return [i for cell in r for i in cell]
+    # 열마다 글머리표 목록인 부분: 줄마다 행을 나누면 칸이 계단처럼 흩어진다 → 연속된 글머리표 행을 한 행으로
+    out: list = []
+    for r in grid:
+        bul = all(bullet(texts[i].lstrip()) for i in ids_of(r))
+        if out and bul and out[-1][1]:
+            out[-1][0] = [a + b for a, b in zip(out[-1][0], r)]
+            continue
+        out.append([r, bul])
+    grid = [r for r, _ in out]
+    # 숫자·글머리표 없는 이웃 행이 서로 다른 열만 채우면(아래 맞춤 머리글 'Perform …' / 'Memorize facts, …') 한 행으로
+    out = []
+    for r in grid:
+        plain_row = not any(bullet(texts[i].lstrip()) or any(ch.isdigit() for ch in texts[i]) for i in ids_of(r))
+        if out and plain_row and out[-1][1] and all(not (a and b) for a, b in zip(out[-1][0], r)):
+            out[-1][0] = [a + b for a, b in zip(out[-1][0], r)]
+            continue
+        out.append([r, plain_row])
+    grid = [r for r, _ in out]
 
     all_cells = [c for r in rows for c in r] + list(super_rows or [])
     x0 = min(c["bbox"].x0 for c in all_cells)

@@ -753,6 +753,45 @@ def _fix_drop_caps(raw: dict) -> None:
                              max(bb[2] for bb in boxes), max(bb[3] for bb in core))
 
 
+def _fix_text_drop_caps(raw: dict) -> None:
+    """글자층에 있는 장식 첫 글자(drop cap): 'T' 한 글자가 큰 글씨로 따로 있고 오른쪽 줄이 'he content…'로
+    시작한다. 큰 글자를 그 줄 맨 앞에 붙이고 따로 있던 글자는 지운다(안 그러면 앞 블록과 묶여 제목이 된다)."""
+    lines = [l for b in raw["blocks"] for l in b.get("lines", [])]
+    sizes = sorted(sp["size"] for l in lines for sp in l["spans"] if sp.get("chars"))
+    if not sizes:
+        return
+    body = sizes[len(sizes) // 2]
+    for l in lines:
+        chars = [c for sp in l["spans"] for c in sp["chars"] if not c["c"].isspace()]
+        if len(chars) != 1 or not chars[0]["c"].isalpha() or not chars[0]["c"].isupper():
+            continue
+        sp = next(sp for sp in l["spans"] if chars[0] in sp["chars"])
+        if sp["size"] < body * 1.8:
+            continue
+        x1, y0, y1 = l["bbox"][2], l["bbox"][1], l["bbox"][3]
+        right = [m for m in lines if m is not l and x1 - 3 <= m["bbox"][0] <= x1 + 25
+                 and y0 - 6 <= m["bbox"][1] <= y0 + (y1 - y0) * 0.4]
+        right = [m for m in right if any(c["c"].strip() for s2 in m["spans"] for c in s2["chars"])]
+        if not right:
+            continue
+        m = min(right, key=lambda m: m["bbox"][1])
+        fsp = next(s2 for s2 in m["spans"] if s2["chars"])
+        h = next(c for c in fsp["chars"] if c["c"].strip())
+        if not h["c"].islower():
+            continue
+        w = (h["bbox"][2] - h["bbox"][0]) * 1.2
+        fsp["chars"].insert(fsp["chars"].index(h), dict(h, c=chars[0]["c"],
+                            bbox=(h["bbox"][0] - w, h["bbox"][1], h["bbox"][0], h["bbox"][3]),
+                            origin=(h["bbox"][0] - w, h["origin"][1])))
+        sp["chars"] = [c for c in sp["chars"] if c is not chars[0]]
+        l["spans"] = [s2 for s2 in l["spans"] if s2["chars"]]
+        if not l["spans"]:
+            l["bbox"] = (x1, y0, x1, y0)
+    for b in raw["blocks"]:
+        if "lines" in b:
+            b["lines"] = [l for l in b["lines"] if l["spans"]]
+
+
 def _norm_tok(t: str) -> str:
     return t.lower().rstrip(".,;:")
 
@@ -1248,6 +1287,10 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
            "scan"  : 글자가 사진으로 된 스캔 쪽 → OCR(build_ocr_page) 후 "text"가 된다
     """
     raw = _drop_overprint(page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_IMAGES))
+    try:
+        _fix_text_drop_caps(raw)
+    except Exception:
+        pass
     if not _in_rotated:
         try:
             _mark_synthetic_italics(page, raw)
@@ -1522,6 +1565,8 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
     H = page_rect.height
     figs = [pymupdf.Rect(f) for f in figs]
     taken: set[int] = set()
+    all_sizes = sorted(l.get("size", 10) for _, ls in block_lines for l in ls)
+    body_sz = all_sizes[len(all_sizes) // 2] if all_sizes else 10
     changed = True
     while changed:
         changed = False
@@ -1529,6 +1574,18 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
             if k in taken:
                 continue
             text = " ".join(l["text"].strip() for l in lines)
+            # 그림 바로 옆에 세로로 늘어선 짧은 범례('Bar graph, histogram' / 'Pie chart …'): 그림 높이 안, 옆 20pt 이내
+            leg = next((fi for fi, f in enumerate(figs) if not f.contains(bbox)
+                        and bbox.y0 >= f.y0 + 4 and bbox.y1 <= f.y1 + 4
+                        and ((bbox.x0 <= f.x1 + 20 and bbox.x1 >= f.x1 - 4)
+                             or (bbox.x1 >= f.x0 - 20 and bbox.x0 <= f.x0 + 4))
+                        and all(len(l["text"].strip()) <= 40 and not SENTENCE_END_RE.search(l["text"].strip())
+                                and l.get("size", 10) <= body_sz * 0.95 for l in lines)), None)
+            if leg is not None and not CAPTION_RE.match(text):
+                figs[leg] = pymupdf.Rect(figs[leg]) | bbox
+                taken.add(k)
+                changed = True
+                continue
             in_head_band = bbox.y1 < max(62, H * 0.115) and not NUMERIC_LABEL_RE.match(text)
             if CAPTION_RE.match(text) or DOWNLOAD_NOTICE_RE.search(text) or in_head_band or bbox.y0 > H - 70:
                 continue
@@ -1725,13 +1782,14 @@ def _fix_kinds(blocks: list[dict], page_rect: pymupdf.Rect, body: float) -> None
     - 위아래가 비어 있는 짧은 Title Case 한 줄('Conceptual Framework')은 소제목"""
     W = page_rect.width
     # OCR이 캡션 줄을 좌우 두 조각으로 나눈 경우('Figure 9.' | 'Box plots of …'): 같은 높이 띠의 조각을 캡션에 합친다
+    # ('Table 2 presents …'처럼 표 이름으로 시작하는 본문 문단은 아니다: 캡션 조각은 길어야 3줄)
     for b in [x for x in blocks if x["kind"] in ("para", "note", "caption") and CAPTION_RE.match(x.get("text", ""))]:
-        if b not in blocks or not b.get("lines"):
+        if b not in blocks or not b.get("lines") or len(b["lines"]) > 3:
             continue
         band = [o for o in blocks if o is not b and o["kind"] in ("para", "note") and o.get("lines")
                 and (abs(o["bbox"].y0 - b["bbox"].y0) <= 3
                      or (o["bbox"].y0 >= b["bbox"].y0 - 3 and o["bbox"].y1 <= b["bbox"].y1 + 3))
-                and len(o["lines"]) <= 8]
+                and len(o["lines"]) <= 3]
         if band:
             ls = list(b["lines"]) + [l for o in band for l in o["lines"]]
             ls.sort(key=lambda l: (round(l["bbox"].y0 / 4), l["bbox"].x0))
@@ -2238,7 +2296,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-13a"
+EXTRACT_VERSION = "2026-10-13b"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
@@ -2349,6 +2407,7 @@ def extract_document(doc: pymupdf.Document, progress=None, workers: int | None =
         pages[0]["blocks"] = heads + sorted(metas, key=lambda b: b["bbox"].y0) + [b for b in rest if b["kind"] != "header"]
     _mark_repeated_margins(pages)
     _restore_top_headings(pages)
+    _restore_top_captions(pages)
     _assign_printed_numbers(pages)
     mark_references(pages)
     # 쪽 경계에서 끊긴 문장은 옮기지 않는다: 번역본 n쪽 = 원문 n쪽 내용 (원문 대조가 우선)
@@ -2535,7 +2594,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0
             out.append(f'<p class="fig"><img src="{b["img_name"]}" width="{w:.0f}" height="{h:.0f}"/></p>')
             if b.get("tr_items") and b.get("items"):
                 # 그림 속 문구: 원문 | 번역 (그림은 원본 그대로 두어 글자·수치를 가리지 않는다)
-                pairs = [(esc(plain(o)), to_reading_html(t)) for o, t in zip(b["items"], b["tr_items"])]
+                pairs = [(esc(plain(o)), to_reading_html(t)) for o, t in zip(b["items"], b["tr_items"])
+                         if re.sub(r"\s+", " ", plain(o)).strip() != re.sub(r"\s+", " ", plain(t)).strip()]
                 cw = box_width / 4 - 8
                 if len(pairs) >= 4 and box_width > 250:   # 짧은 문구가 많으면 두 쌍씩 한 줄에
                     rows = "".join(
@@ -2544,7 +2604,8 @@ def _pieces(blocks: list[dict], box_width: float = 360.0, fig_scale: float = 1.0
                         for i in range(0, len(pairs), 2))
                 else:
                     rows = "".join(f'<tr><td class="src">{o}</td><td>{t}</td></tr>' for o, t in pairs)
-                out.append(f'<table class="figlab">{rows}</table>')
+                if pairs:                               # 번역해도 그대로인 기호('B D E F NCTM')만 있으면 표를 싣지 않는다
+                    out.append(f'<table class="figlab">{rows}</table>')
     foot = [b for b in blocks if b["kind"] == "footnote"]
     if foot:
         out.append("<hr/>" + "".join(
@@ -2578,6 +2639,59 @@ def _mark_repeated_margins(pages: list[dict]) -> None:
                 same = {i for i, y in seen[norm(b["text"])] if abs(y - b["bbox"].y0) <= 4}
                 if len(same) >= 3 and pg_i != min(same):   # 처음 나오는 쪽 하나는 남긴다(학술지 정보 1회 표시)
                     b["kind"] = "header"
+
+
+def _restore_top_captions(pages: list[dict]) -> None:
+    """쪽 맨 위에 놓인 표·부록 제목('Table 2' / 'Alignment of …', 'Appendix' / 'Language …')이 머리글 구역에
+    있다고 머리글로 빠지면 번역되지 않는다. 다른 쪽에 반복되지 않고 'Table/Figure/Appendix'로 시작하는 줄과,
+    그 바로 아래(8pt 이내)에 이어지는 반복되지 않는 줄들은 캡션으로 되돌린다."""
+    from collections import Counter
+
+    def norm(t: str) -> str:
+        return re.sub(r"[\d\W_]+", "", t).lower()
+
+    cnt: Counter = Counter()
+    for pg in pages:
+        for t in {norm(b["text"]) for b in pg.get("blocks", []) if b["kind"] == "header"}:
+            cnt[t] += 1
+    start = re.compile(r"^\s*(TABLE|Table|FIGURE|Figure|Fig\.|APPENDIX|Appendix|Exhibit|EXHIBIT)\b")
+    for pg in pages:
+        heads = sorted([b for b in pg.get("blocks", []) if b["kind"] == "header" and b.get("bbox") is not None
+                        and not b.get("noise") and cnt[norm(b["text"])] <= 1
+                        and not DOWNLOAD_NOTICE_RE.search(b["text"]) and len(b["text"]) < 120
+                        and not re.fullmatch(r"[\d\s.\-–|]+", b["text"])], key=lambda b: b["bbox"].y0)
+        cur, last, drop = None, None, []
+        for b in heads:
+            if start.match(b["text"]):
+                b["kind"] = "caption"; cur = last = b
+                b["_top_pieces"] = [b.get("html", "")]
+            elif cur is not None and 0 <= b["bbox"].y0 - last["bbox"].y1 <= 8:
+                # 'Appendix' + 'Language …'는 한 캡션으로 (따로 두면 표 위·아래로 갈라져 놓인다)
+                cur["html"] = cur.get("html", "") + "<br/>" + b.get("html", "")
+                cur["text"] = cur["text"] + " " + b["text"]
+                cur["bbox"] = pymupdf.Rect(cur["bbox"]) | b["bbox"]
+                cur["lines"] = (cur.get("lines") or []) + (b.get("lines") or [])
+                cur["_top_pieces"].append(b.get("html", ""))
+                last = b
+                drop.append(b)
+        if drop:
+            pg["blocks"] = [b for b in pg["blocks"] if not any(b is d for d in drop)]
+        # 바로 아래가 쪽 너비 표면 캡션을 표 제목으로 넣는다 (표 위 좁은 틈에 따로 짜면 글씨가 아주 작아진다)
+        for cap in [b for b in pg["blocks"] if b["kind"] == "caption" and b.get("_top_pieces")]:
+            tb = next((t for t in pg["blocks"] if t["kind"] == "table" and t.get("layout") is not None
+                       and not t["layout"].get("title") and 0 <= t["bbox"].y0 - cap["bbox"].y1 <= 20
+                       and min(t["bbox"].x1, cap["bbox"].x1) - max(t["bbox"].x0, cap["bbox"].x0) > 0), None)
+            if tb is None:
+                continue
+            idx = []
+            for h in cap["_top_pieces"]:
+                tb["items"].append(h)
+                idx.append(len(tb["items"]) - 1)
+            tb["layout"]["title"] = idx
+            tb["text"] = cap["text"] + "\n" + tb.get("text", "")
+            pg["blocks"] = [b for b in pg["blocks"] if b is not cap]
+        for b in pg["blocks"]:
+            b.pop("_top_pieces", None)
 
 
 def _restore_top_headings(pages: list[dict]) -> None:
