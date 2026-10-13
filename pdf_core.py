@@ -1236,7 +1236,7 @@ def _unheader_column_tops(blocks: list[dict], body: float) -> None:
                 continue
             elif o["kind"] in ("para", "note", "reference", "list") and gap <= 8 \
                     and abs(o["size"] - b["size"]) < 0.6 and b["size"] >= body * 0.95:
-                b["kind"] = o["kind"]
+                b["kind"] = "para" if o["kind"] == "list" else o["kind"]   # list는 items가 있어야 해서 문단으로
                 changed = True
 
 
@@ -2238,7 +2238,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-11f"
+EXTRACT_VERSION = "2026-10-13a"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
