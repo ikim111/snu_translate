@@ -40,6 +40,11 @@ def framing():
     return _load("FRAMING_PDF")          # Gutiérrez (2009) Framing Equity — 겹쳐 찍은 글자, 기울여 그린 이탤릭
 
 
+@pytest.fixture(scope="module")
+def porter():
+    return _load("PORTER_PDF")           # Porter (2002) — 장식 첫 글자, 쪽 위 표 제목, 옆 범례 그림, 여러 줄 칸 표
+
+
 def kinds(pg, k):
     return [b for b in pg["blocks"] if b["kind"] == k]
 
@@ -194,3 +199,20 @@ def test_framing_equity(framing):
     h2 = " ".join(b.get("html") or "" for b in pages[1]["blocks"])
     for w in ("Access", "Achievement", "Identity", "past"):
         assert f"<i>{w}</i>" in h2
+
+
+def test_porter(porter):
+    d, pages = porter
+    p1 = pages[0]["blocks"]
+    assert not any(b["kind"] == "heading" and b["text"].rstrip().endswith(" T") for b in p1)
+    assert any(b["text"].startswith("The content of instruction plays") for b in p1)
+    p4 = pages[3]["blocks"]
+    t2 = next(b for b in p4 if b["text"].startswith("Table 2 presents"))
+    assert t2["bbox"].x1 < 300                                  # 오른쪽 단 문단을 삼키지 않음
+    assert any(b["kind"] == "caption" and b["text"].startswith("Table 2") for b in p4)
+    fig7 = kinds(pages[6], "figure")[0]
+    assert fig7["bbox"].x1 > 540                                # 오른쪽 범례까지 그림
+    tb = kinds(pages[10], "table")[0]
+    assert tb["layout"]["title"]                                 # 'Appendix' 제목이 표 제목으로
+    assert len(tb["layout"]["rows"]) <= 4
+    assert not any(it.startswith(("ematical", "cal ideas", "gate ")) for it in tb["items"])
