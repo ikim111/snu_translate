@@ -847,6 +847,9 @@ with st.expander("🧩 마음에 안 드는 쪽만 다시 번역", expanded=bool
 def translated_page(pg: dict) -> dict | None:
     """캐시의 번역을 입힌 페이지 사본. 번역이 없으면 None."""
     entry = cache.get(str(pg["page_number"]))
+    # 번역할 글이 없는 쪽(참고문헌만 있는 쪽 등)은 번역 기록이 없어도 그대로 짠다 ('번역되지 않음' 표시 없이)
+    if pg["mode"] == "text" and not units_of(pg) and not core.figure_jobs(pg) and not cached_ok(pg):
+        return copy.deepcopy(pg)
     if pg["mode"] != "text" or not cached_ok(pg):
         return None
     tpg = copy.deepcopy(pg)
