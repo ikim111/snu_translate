@@ -45,6 +45,11 @@ def porter():
     return _load("PORTER_PDF")           # Porter (2002) — 장식 첫 글자, 쪽 위 표 제목, 옆 범례 그림, 여러 줄 칸 표
 
 
+@pytest.fixture(scope="module")
+def tran():
+    return _load("TRAN_PDF")             # Tran & Tarr (2018) — 칸 사이 좁은 글자 표(부록 2), 그래프 아래 범례
+
+
 def kinds(pg, k):
     return [b for b in pg["blocks"] if b["kind"] == k]
 
@@ -216,3 +221,16 @@ def test_porter(porter):
     assert tb["layout"]["title"]                                 # 'Appendix' 제목이 표 제목으로
     assert len(tb["layout"]["rows"]) <= 4
     assert not any(it.startswith(("ematical", "cal ideas", "gate ")) for it in tb["items"])
+
+
+def test_tran(tran):
+    d, pages = tran
+    t = kinds(pages[19], "table")[0]                            # 부록 2 표 5: 4열 표
+    hdr = [t["items"][i] if i is not None else "" for i in t["layout"]["header"]]
+    assert hdr == ["Process component", "Level A", "Level B", "Level C"]
+    col0 = [t["items"][r[0][0]] for r in t["layout"]["rows"] if r[0]]
+    assert "I. Formulate question" in col0 and "IV. Interpret Results" in col0
+    assert any("Teachers pose questions of interest" == t["items"][i] for r in t["layout"]["rows"] for i in r[1])
+    for pn in (13, 14):                                         # 범례·가로축 이름은 그림 안
+        assert not any(b["kind"] == "heading" and b["text"].strip() in ("Level A", "Level B", "Level C", "High", "Low")
+                       for b in pages[pn - 1]["blocks"])
