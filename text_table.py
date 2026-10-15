@@ -86,7 +86,7 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         spans_x = sorted((c["bbox"].x0, c["bbox"].x1) for r in cands for c in r)
         groups: list[list[float]] = []          # [x0, x1, count]
         for x0, x1 in spans_x:
-            if groups and x0 <= groups[-1][1] + 2:
+            if groups and x0 <= groups[-1][1] + 3.5:
                 groups[-1][1] = max(groups[-1][1], x1)
                 groups[-1][2] += 1
             else:
@@ -98,6 +98,11 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
             return bool(cells) and all(len(c["text"].strip()) > 25 and not any(ch.isdigit() for ch in c["text"])
                                        for c in cells)
         groups = [g for g in groups if not caption_like(g)]
+        # 맨 왼쪽 행 이름 열('I.' / 'Formu-' / 'II. Collect')은 칸이 드물어 빠질 수 있다 → 왼쪽에 모여 있으면 열로
+        if groups:
+            left = [c for r in cands for c in r if c["bbox"].x1 <= groups[0][0] - 3]
+            if len(left) >= 4 and max(c["bbox"].x0 for c in left) - min(c["bbox"].x0 for c in left) <= 15:
+                groups.insert(0, [min(c["bbox"].x0 for c in left), max(c["bbox"].x1 for c in left), len(left)])
         if len(groups) < 2:
             i = j + 1
             continue
@@ -124,7 +129,10 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
         ranged = [[c for c in r if in_range(c)] for r in run]
         ranged = [r for r in ranged if r]
         def data_like(r: list[dict]) -> bool:
-            return is_candidate(r) and len(r) >= 2 and sum(col_of(c) is not None for c in r) >= 2
+            cols = [col_of(c) for c in r]
+            # 칸 사이가 좁은 글자 표(8pt 간격): 칸들이 서로 다른 열에 하나씩 놓이면 표의 행
+            distinct = None not in cols and len(set(cols)) == len(cols)
+            return (is_candidate(r) or distinct) and len(r) >= 2 and sum(c is not None for c in cols) >= 2
 
         def has_num(r: list[dict]) -> bool:
             return any(any(ch.isdigit() for ch in c["text"]) for c in r if col_of(c) != 0)
@@ -154,14 +162,24 @@ def find_text_tables(lines: list[dict], page_rect: pymupdf.Rect) -> list[dict[st
                 # 첫 열 머리글('Occupation') 바로 위에 다른 열 머리글 줄이 붙어 있으면 머리행의 일부
                 r2 = ranged[top - 2]
                 if len(r2) >= 1 and any(col_of(c) not in (0, None) for c in r2) and \
-                        r[0]["_yc"] - r2[0]["_yc"] <= r[0]["size"] * 2.0 and gap <= r[0]["size"] * 2.0:
+                        r[0]["_yc"] - r2[0]["_yc"] <= r[0]["size"] * 2.0 \
+                        and gap <= r[0]["size"] * (2.0 if numeric_table else 5):
                     only_col0 = False
-            if gap > r[0]["size"] * 2.6 or only_col0:
+            hdr_like = not numeric_table and (top == first or (top == first - 1 and len(ranged[top]) == 1)) \
+                and len({col_of(c) for c in r} - {None}) >= 2 and all(len(c["text"].strip()) <= 20 for c in r)
+            if gap > r[0]["size"] * (5 if hdr_like else 2.6) or only_col0:
                 break
             top -= 1
         # 아래로: 행 간격이 크게 벌어지기 전까지
         bot = first
-        while bot + 1 < len(ranged) and ranged[bot + 1][0]["_yc"] - ranged[bot][0]["_yc"] <= ranged[bot][0]["size"] * 3.2:
+        while bot + 1 < len(ranged):
+            gap = ranged[bot + 1][0]["_yc"] - ranged[bot][0]["_yc"]
+            lim = ranged[bot][0]["size"] * 3.2
+            # 글자 표의 첫 행이 열 머리글('Level A | Level B | Level C')이면 그 아래 간격이 넓을 수 있다
+            if bot == first and not numeric_table and len({col_of(c) for c in ranged[bot + 1]} - {None}) >= 2:
+                lim = ranged[bot][0]["size"] * 5
+            if gap > lim:
+                break
             bot += 1
         table_rows = ranged[top:bot + 1]
         if sum(1 for r in table_rows if len(r) >= 2) < 3:
@@ -335,12 +353,23 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
     header: list[int | None] = [None] * ncol
     if header_n == 0 and group_row is None and len(grid) >= 2 and not has_digit(grid[0]) and has_digit(grid[1]):
         header_n = 1
+    # 글자 표: 첫 행이 짧은 이름들('Level A | Level B | Level C')이고 다음 행부터 긴 글이면 열 머리글
+    def lens(r):
+        return [len(texts[i]) for cell in r for i in cell]
+    if header_n == 0 and group_row is None and len(grid) >= 3 and not has_digit(grid[0]) \
+            and sum(1 for cell in grid[0] if cell) >= 2 and max(lens(grid[0])) <= 20 \
+            and max(lens(grid[1]) + lens(grid[2])) > 20:
+        header_n = 1
+        # 첫 열 머리글의 둘째 줄('Process' / 'component')
+        if sum(1 for cell in grid[1] if cell) == 1 and grid[1][0] and texts[grid[1][0][0]][:1].islower():
+            header_n = 2
     if header_n:
         for c in range(ncol):
             idxs = [i for r in grid[:header_n] for i in r[c]]
             if idxs:
-                items.append(" ".join(items[i] for i in idxs))
-                texts.append(" ".join(texts[i] for i in idxs))
+                sp = re.compile(r"\b(?:\w ){2,}\w\b")          # 자간을 벌린 'P r o c e s s' → 'Process'
+                items.append(sp.sub(lambda m: m.group(0).replace(" ", ""), " ".join(items[i] for i in idxs)))
+                texts.append(sp.sub(lambda m: m.group(0).replace(" ", ""), " ".join(texts[i] for i in idxs)))
                 header[c] = len(items) - 1
         grid = grid[header_n:]
 
@@ -391,12 +420,19 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
                 k += 1
                 continue
             j = k + 1
-            while j < len(grid) and len(grid[j][c]) == 1 and grid[j][c][0] < len(boxes):
+            while True:
+                # 사이에 이 열이 빈 행(다른 열의 줄)이 끼어 있어도 건너뛴다
+                while j < len(grid) and not grid[j][c]:
+                    j += 1
+                if not (j < len(grid) and len(grid[j][c]) == 1 and grid[j][c][0] < len(boxes)):
+                    break
                 a, b = cell[-1], grid[j][c][0]
                 ta, tb = texts[a].rstrip(), texts[b].lstrip()
                 gap = boxes[b][0].y0 - boxes[a][0].y1
-                cont = (tb[:1].islower() or ta.endswith(("-", ",", "/"))) and not bullet(tb) \
-                    and gap <= boxes[a][1] * 0.6 and (len(ta) >= 6 or ta.endswith("-"))
+                roman = bool(re.fullmatch(r"[IVX]{1,4}\.", ta)) or (    # 'I.' + 'Formu-', 'IV. Interpret' + 'Results'
+                    bool(re.match(r"[IVX]{1,4}\.\s", ta)) and len(tb.split()) <= 2 and len(ta) <= 25)
+                cont = (tb[:1].islower() or ta.endswith(("-", ",", "/")) or roman) and not bullet(tb) \
+                    and gap <= boxes[a][1] * (1.2 if roman else 0.6) and (len(ta) >= 6 or ta.endswith("-") or roman)
                 if not cont:
                     break
                 if ta.endswith("-") and tb[:1].islower():
@@ -408,7 +444,7 @@ def _build(rows: list[list[dict]], col_x: list[float], col_of, header_n: int = 0
                 boxes[a] = (boxes[a][0] | boxes[b][0], boxes[a][1])
                 grid[j][c] = []
                 j += 1
-            k = j if j > k + 1 else k + 1
+            k += 1
     grid = [r for r in grid if any(r)]
 
     def ids_of(r):

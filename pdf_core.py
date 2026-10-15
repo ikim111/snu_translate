@@ -1565,8 +1565,13 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
     H = page_rect.height
     figs = [pymupdf.Rect(f) for f in figs]
     taken: set[int] = set()
-    all_sizes = sorted(l.get("size", 10) for _, ls in block_lines for l in ls)
-    body_sz = all_sizes[len(all_sizes) // 2] if all_sizes else 10
+    # 본문 글자 크기: 글자 수가 가장 많은 크기 (그래프 눈금 줄이 많은 쪽에서도 본문 기준이 되게)
+    by_size: dict[float, int] = {}
+    for _, ls in block_lines:
+        for l in ls:
+            k = round(l.get("size", 10), 1)
+            by_size[k] = by_size.get(k, 0) + len(l.get("text", ""))
+    body_sz = max(by_size, key=by_size.get) if by_size else 10
     changed = True
     while changed:
         changed = False
@@ -1583,6 +1588,16 @@ def _grow_figures(figs: list[pymupdf.Rect], block_lines: list, page_rect: pymupd
                                 and l.get("size", 10) <= body_sz * 0.95 for l in lines)), None)
             if leg is not None and not CAPTION_RE.match(text):
                 figs[leg] = pymupdf.Rect(figs[leg]) | bbox
+                taken.add(k)
+                changed = True
+                continue
+            # 그림 바로 아래의 가로축 이름·범례 줄('HML (Traditional) UCSMP …', 'Level C  Level B  Level A')
+            below = next((fi for fi, f in enumerate(figs) if not f.contains(bbox)
+                          and -2 <= bbox.y0 - f.y1 <= 12 and bbox.x0 >= f.x0 - 8 and bbox.x1 <= f.x1 + 15
+                          and len(text) <= 80 and not re.search(r"[.?!:]\s*$", text)
+                          and all(l.get("size", 10) <= body_sz * 0.95 for l in lines)), None)
+            if below is not None and not CAPTION_RE.match(text):
+                figs[below] = pymupdf.Rect(figs[below]) | bbox
                 taken.add(k)
                 changed = True
                 continue
