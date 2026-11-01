@@ -50,6 +50,11 @@ def tran():
     return _load("TRAN_PDF")             # Tran & Tarr (2018) — 칸 사이 좁은 글자 표(부록 2), 그래프 아래 범례
 
 
+@pytest.fixture(scope="module")
+def esmonde():
+    return _load("ESMONDE_PDF")          # Esmonde & Langer-Osuna (2013) — 줄 번호·화자·발화·몸짓 대화 발췌문
+
+
 def kinds(pg, k):
     return [b for b in pg["blocks"] if b["kind"] == k]
 
@@ -234,3 +239,20 @@ def test_tran(tran):
     for pn in (13, 14):                                         # 범례·가로축 이름은 그림 안
         assert not any(b["kind"] == "heading" and b["text"].strip() in ("Level A", "Level B", "Level C", "High", "Low")
                        for b in pages[pn - 1]["blocks"])
+
+
+def test_esmonde(esmonde):
+    d, pages = esmonde
+    t = [b for b in pages[10]["blocks"] if b.get("transcript")][0]   # 발췌문 1: 줄별 표
+    rows = t["layout"]["rows"]
+    assert len(rows) >= 15
+    first = [" / ".join(t["items"][i] for i in cell) for cell in rows[0]]
+    assert first[0] == "1–2" and first[1] == "Riley:" and "₁much" in first[2]
+    assert any("1. Riley moves his hand" in t["items"][i] for i in rows[0][2])
+    keep = set(t["layout"]["keep"])
+    units = [ii for bi, ii, _ in c.translatable_units(pages[10]) if pages[10]["blocks"][bi] is t]
+    assert not keep & set(units)                                    # 줄 번호·화자는 번역하지 않음
+    assert not any("\x07" in it for it in t["items"])
+    for pn in (14, 15, 18, 19, 21):
+        assert any(b.get("transcript") for b in pages[pn - 1]["blocks"])
+    assert not any(b.get("transcript") for pg in pages[:10] for b in pg["blocks"])   # 본문 쪽은 그대로

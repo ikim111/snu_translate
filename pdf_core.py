@@ -150,7 +150,7 @@ def _line(line: dict, body: float, mixed: bool = True) -> dict:
     sizes: list[float] = []
     seen_text = False
     for idx, s in enumerate(line["spans"]):
-        t = _span_text(s, s["size"])
+        t = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", _span_text(s, s["size"]))   # 글자층의 제어 문자(BEL 등)
         if not t:
             continue
         t = _fix_symbol(t, s, first=not seen_text)
@@ -161,8 +161,15 @@ def _line(line: dict, body: float, mixed: bool = True) -> dict:
         e = esc(t)
         lead = e[: len(e) - len(e.lstrip())]
         is_sup = s["size"] < body * 0.8 and s["bbox"][3] < base_y - 1 and t.strip().isdigit()
+        # 아래첨자 숫자(대화 발췌문의 몸짓 표시 '₁much', 수식 x₁): 큰 글자보다 아래로 내려앉은 작은 숫자
+        tops = [o["bbox"][1] for o in line["spans"] if o["size"] >= s["size"] * 1.15]
+        is_sub = (not is_sup and t.strip().isdigit() and s["size"] < body * 0.85 and tops
+                  and s["bbox"][1] > min(tops) + s["size"] * 0.35)
         if is_sup:
             e = f"<sup>{e.strip()}</sup>"
+        elif is_sub:
+            e = lead + e.strip().translate(str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉"))
+            t = t[:len(t) - len(t.lstrip())] + t.strip().translate(str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉"))
         elif _is_italic(s) and len(t.strip()) >= ITALIC_MIN_CHARS:
             e = f"{lead}<i>{e.strip()}</i>"
         elif _is_bold(s) and len(t.strip()) >= 2 and mixed:
@@ -1279,6 +1286,104 @@ def _unheader_column_tops(blocks: list[dict], body: float) -> None:
                 changed = True
 
 
+SPEAKER_ONLY_RE = re.compile(r"^\s*[A-Z][A-Za-z.'’\- ]{0,24}:\s*$")
+GESTURE_RE = re.compile(r"^\s*\d{1,2}\.\s")
+
+
+def _transcript_tables(lines: list[dict]) -> list[dict]:
+    """대화 발췌문(줄 번호 | 화자 | 발화, 발화 아래 '1. 몸짓 설명')을 줄별 표로 읽는다.
+    문단으로 읽으면 줄 번호·화자·발화·몸짓이 한 덩어리로 이어 붙는다 (Esmonde & Langer-Osuna 2013).
+    화자 칸에는 'Riley:'처럼 이름과 쌍점만 있고, 그 왼쪽에 줄 번호, 오른쪽에 발화가 같은 x에서 시작한다."""
+    spk = [l for l in lines if SPEAKER_ONLY_RE.match(l["text"]) and l["bbox"].width < 90]
+    if len(spk) < 3:
+        return []
+    # 화자 칸 x가 같은 줄끼리 (여백이 다른 단·쪽 배치를 섞지 않게)
+    xs = sorted(round(l["bbox"].x0) for l in spk)
+    x_s = max(set(xs), key=lambda x: sum(abs(y - x) <= 4 for y in xs))
+    spk = sorted([l for l in spk if abs(l["bbox"].x0 - x_s) <= 4], key=lambda l: l["bbox"].y0)
+    if len(spk) < 3:
+        return []
+    right = [l for l in lines if l["bbox"].x0 > max(s["bbox"].x1 for s in spk) - 2]
+    starts = []
+    for s in spk:
+        same = [l for l in right if abs((l["bbox"].y0 + l["bbox"].y1) / 2 - (s["bbox"].y0 + s["bbox"].y1) / 2) <= 3]
+        if same:
+            starts.append(min(l["bbox"].x0 for l in same))
+    if len(starts) < 3:
+        return []
+    x_c = statistics.median(starts)
+    if sum(abs(x - x_c) <= 4 for x in starts) < len(starts) * 0.7:
+        return []
+    nums = [l for l in lines if re.fullmatch(r"\s*\d{1,3}\s*", l["text"]) and l["bbox"].x1 < x_s]
+    x_n0 = min((l["bbox"].x0 for l in nums), default=x_s)
+    content = sorted([l for l in lines if abs(l["bbox"].x0 - x_c) <= 6 or (x_c - 6 < l["bbox"].x0 < x_c + 40
+                      and l not in spk)], key=lambda l: l["bbox"].y0)
+    # 표 아래 끝: 마지막 화자 뒤로 같은 칸에서 이어지는 줄까지 (줄 간격이 크게 벌어지면 끝)
+    y_top = spk[0]["bbox"].y0 - 2
+    y_end = spk[-1]["bbox"].y1
+    for l in content:
+        if l["bbox"].y0 >= y_end - 1:
+            if l["bbox"].y0 - y_end > l["size"] * 1.6:
+                break
+            y_end = l["bbox"].y1
+    content = [l for l in content if y_top <= l["bbox"].y0 < y_end]
+    nums = [l for l in nums if y_top - 2 <= l["bbox"].y0 < y_end]
+    # 화자 칸 왼쪽 끝이 본문 여백과 같고 오른쪽 칸 줄이 문장이면(본문 속 대화 인용) 표가 아니다
+    # 줄 번호 칸이 있어야 대화 발췌문 (인터뷰 기사의 'M:' / 'RG:' 문단은 줄 번호 없이 긴 글이 이어진다)
+    if not content or len(nums) < len(spk) * 0.6:
+        return []
+    items: list[str] = []
+    rows = []
+    keep: list[int] = []
+    used: list[int] = []
+    bounds = [s["bbox"].y0 - 2 for s in spk] + [y_end + 1]
+    # 첫 화자 위에 줄 번호만 있는 줄(앞 쪽에서 이어지는 발화)은 첫 행 앞에 따로 둔다
+    if any(l["bbox"].y0 < bounds[0] - 1 for l in content):
+        bounds = [y_top - 30] + bounds
+        spk = [None] + spk
+
+    def clean(h: str) -> str:
+        return re.sub(r"</?i>", "", h).strip()
+    for k, s in enumerate(spk):
+        lo, hi = bounds[k], bounds[k + 1]
+        cl = [l for l in content if lo <= l["bbox"].y0 < hi]
+        nl = [l for l in nums if lo - 1 <= l["bbox"].y0 < hi]
+        if not cl and s is None:
+            continue
+        no = [l["text"].strip() for l in sorted(nl, key=lambda l: l["bbox"].y0)]
+        cells = []
+        items.append(no[0] + ("–" + no[-1] if len(no) > 1 else "") if no else "")
+        keep.append(len(items) - 1); cells.append([len(items) - 1])
+        items.append(clean(s["html"]) if s else "")
+        keep.append(len(items) - 1); cells.append([len(items) - 1])
+        utter = [l for l in cl if not GESTURE_RE.match(l["text"])]
+        gest = [l for l in cl if GESTURE_RE.match(l["text"])]
+        idx = []
+        if utter:
+            h, _ = join_lines(utter)
+            items.append(_protect(h)); idx.append(len(items) - 1)
+        for g in gest:
+            items.append(_protect(clean(g["html"]))); idx.append(len(items) - 1)
+        cells.append(idx)
+        rows.append(cells)
+        used += [l["id"] for l in cl + nl] + ([s["id"]] if s else [])
+    if len(rows) < 3:
+        return []
+    allb = [l["bbox"] for l in lines if l["id"] in set(used)]
+    bb = pymupdf.Rect(allb[0])
+    for r in allb[1:]:
+        bb |= r
+    x0, x1 = min(x_n0, bb.x0), bb.x1
+    layout = {"title": None, "super": None, "group_row": None, "header": [None, None, None], "rows": rows,
+              "note": None, "bulleted": [], "keep": keep,
+              "col_x": [0, x_s - x0, x_c - x0, x1 - x0], "width": x1 - x0}
+    text = "\n".join(re.sub(r"<[^>]+>", "", t) for t in items)
+    size = statistics.median(l["size"] for l in content)
+    return [{"kind": "table", "bbox": bb, "size": size, "items": items, "layout": layout, "transcript": True,
+             "html": "", "text": text, "line_ids": used}]
+
+
+
 def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any]:
     """원문 페이지 1장 → {"mode", "body_size", "blocks"}.
 
@@ -1364,12 +1469,17 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
         return any(f.contains(c) for f in figs)
 
     try:
+        transcripts = _transcript_tables([l for _, ls in block_lines for l in ls if not in_fig(l["bbox"])])
+    except Exception:
+        transcripts = []
+    tr_ids = {i for t in transcripts for i in t.pop("line_ids")}
+    try:
         tables = text_table.find_text_tables(
-            [l for _, ls in block_lines for l in ls if not in_fig(l["bbox"])], page.rect)
+            [l for _, ls in block_lines for l in ls if not in_fig(l["bbox"]) and l["id"] not in tr_ids], page.rect)
     except Exception:
         tables = []
-    table_ids = {i for t in tables for i in t.pop("line_ids")}
-    blocks += tables
+    table_ids = {i for t in tables for i in t.pop("line_ids")} | tr_ids
+    blocks += transcripts + tables
 
     for bbox, lines in block_lines:
         if table_ids:
@@ -2311,7 +2421,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-10-15a"
+EXTRACT_VERSION = "2026-11-01a"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
@@ -2460,7 +2570,8 @@ def translatable_units(pg: dict, translate_refs: bool = False,
         if (k == "reference" and not translate_refs) or (k == "caption" and not translate_captions):
             continue
         if k in ("list", "table", "dialogue"):
-            units += [(bi, ii, h) for ii, h in enumerate(b["items"])]
+            keep = set((b.get("layout") or {}).get("keep") or [])   # 대화 발췌문의 줄 번호·화자 이름은 번역하지 않는다
+            units += [(bi, ii, h) for ii, h in enumerate(b["items"]) if ii not in keep and h.strip()]
         elif b["html"].strip():
             units.append((bi, None, b["html"]))
     return units
