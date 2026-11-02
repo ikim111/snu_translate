@@ -256,3 +256,8 @@ def test_esmonde(esmonde):
     for pn in (14, 15, 18, 19, 21):
         assert any(b.get("transcript") for b in pages[pn - 1]["blocks"])
     assert not any(b.get("transcript") for pg in pages[:10] for b in pg["blocks"])   # 본문 쪽은 그대로
+    p21 = pages[20]["blocks"]                                       # 두 줄로 나뉜 화자 'Ms.' / 'Delack:'
+    assert not any(b["kind"] == "para" and b["text"].strip() == "Ms." for b in p21)
+    t = [b for b in p21 if b.get("transcript")][0]
+    row = [r for r in t["layout"]["rows"] if t["items"][r[1][0]] == "Ms. Delack:"][0]
+    assert t["items"][row[0][0]] == "5–6" and "from off-camera" in t["items"][row[2][0]]

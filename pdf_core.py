@@ -1303,6 +1303,13 @@ def _transcript_tables(lines: list[dict]) -> list[dict]:
     spk = sorted([l for l in spk if abs(l["bbox"].x0 - x_s) <= 4], key=lambda l: l["bbox"].y0)
     if len(spk) < 3:
         return []
+    # 두 줄로 나뉜 화자 이름('Ms.' / 'Delack:'): 바로 위 화자 칸 줄을 이름 앞부분으로 붙인다
+    pre = {}
+    for s in spk:
+        for l in lines:
+            if l not in spk and abs(l["bbox"].x0 - x_s) <= 4 and l["bbox"].width < 90 and \
+                    -1 <= s["bbox"].y0 - l["bbox"].y1 <= l["size"] * 0.6 and not re.fullmatch(r"\s*\d{1,3}\s*", l["text"]):
+                pre[s["id"]] = l
     right = [l for l in lines if l["bbox"].x0 > max(s["bbox"].x1 for s in spk) - 2]
     starts = []
     for s in spk:
@@ -1336,7 +1343,7 @@ def _transcript_tables(lines: list[dict]) -> list[dict]:
     rows = []
     keep: list[int] = []
     used: list[int] = []
-    bounds = [s["bbox"].y0 - 2 for s in spk] + [y_end + 1]
+    bounds = [(pre[s["id"]] if s["id"] in pre else s)["bbox"].y0 - 2 for s in spk] + [y_end + 1]
     # 첫 화자 위에 줄 번호만 있는 줄(앞 쪽에서 이어지는 발화)은 첫 행 앞에 따로 둔다
     if any(l["bbox"].y0 < bounds[0] - 1 for l in content):
         bounds = [y_top - 30] + bounds
@@ -1354,7 +1361,8 @@ def _transcript_tables(lines: list[dict]) -> list[dict]:
         cells = []
         items.append(no[0] + ("–" + no[-1] if len(no) > 1 else "") if no else "")
         keep.append(len(items) - 1); cells.append([len(items) - 1])
-        items.append(clean(s["html"]) if s else "")
+        p = pre.get(s["id"]) if s else None
+        items.append((clean(p["html"]) + " " if p else "") + clean(s["html"]) if s else "")
         keep.append(len(items) - 1); cells.append([len(items) - 1])
         utter = [l for l in cl if not GESTURE_RE.match(l["text"])]
         gest = [l for l in cl if GESTURE_RE.match(l["text"])]
@@ -1366,7 +1374,7 @@ def _transcript_tables(lines: list[dict]) -> list[dict]:
             items.append(_protect(clean(g["html"]))); idx.append(len(items) - 1)
         cells.append(idx)
         rows.append(cells)
-        used += [l["id"] for l in cl + nl] + ([s["id"]] if s else [])
+        used += [l["id"] for l in cl + nl] + ([s["id"]] if s else []) + ([p["id"]] if p else [])
     if len(rows) < 3:
         return []
     allb = [l["bbox"] for l in lines if l["id"] in set(used)]
@@ -2421,7 +2429,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-11-01a"
+EXTRACT_VERSION = "2026-11-02a"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
