@@ -10,6 +10,10 @@ URL = "https://snutranslate-l2tkvysuh6y5jmmcyr8nhu.streamlit.app/"
 with sync_playwright() as p:
     browser = p.chromium.launch()
     page = browser.new_page()
+    errors = []
+    page.on("console", lambda m: m.type == "error" and errors.append(m.text[:200]))
+    page.on("requestfailed", lambda r: errors.append("요청 실패 " + r.url[-80:]))
+    page.on("response", lambda r: r.status >= 400 and errors.append(f"{r.status} {r.url[-80:]}"))
     page.goto(URL, timeout=120_000)
     page.wait_for_timeout(15_000)
     wake = page.get_by_role("button", name=re.compile(r"get this app back up", re.I))
@@ -35,6 +39,8 @@ with sync_playwright() as p:
         page.wait_for_timeout(5_000)
     if not ok:
         print("frames:", [f.url for f in page.frames])
+        print("오류:", errors[:10])
+        page.screenshot(path="keep_awake.png", full_page=True)
         try:
             print("본문 앞부분:", page.inner_text("body", timeout=2_000)[:300])
         except Exception as e:

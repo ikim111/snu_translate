@@ -14,3 +14,8 @@ jobs:
           python-version: "3.12"
       - run: pip install playwright==1.48.0 && python -m playwright install --with-deps chromium
       - run: python scripts/keep_awake.py
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot
+          path: keep_awake.png
