@@ -1248,6 +1248,36 @@ def _absorb_fragments(blocks: list[dict]) -> None:
         blocks.remove(f)
 
 
+def _attach_item_numbers(blocks: list[dict], body: float) -> None:
+    """번호 목록 표('1.' | 'Where did the data …')에서 번호만 따로 떨어진 블록을 오른쪽 항목 앞에 붙인다.
+    번호만 있는 조각을 따로 번역하면 형식 오류로 그 쪽 번역이 통째로 실패한다 (Gal 2002 표 3).
+    작은 글씨라 각주로 분류된 항목은 표 안 글이므로 본문 흐름의 note로 둔다."""
+    drop = []
+    nums = [b for b in blocks if b.get("lines") and re.fullmatch(r"\s*\(?\d{1,2}\s?[.)]\s*", b.get("text", ""))]
+    for n in nums:
+        r = n["bbox"]
+        cand = [b for b in blocks if b is not n and b not in nums and b.get("lines") and b.get("html")
+                and 0 <= b["bbox"].x0 - r.x1 <= 25 and abs(b["bbox"].y0 - r.y0) <= 4]
+        if not cand:
+            continue
+        t = min(cand, key=lambda b: b["bbox"].x0)
+        num = re.sub(r"\s+", "", n["text"])
+        t["html"] = f"{num} " + t["html"]
+        t["text"] = f"{num} " + t["text"]
+        t["bbox"] = pymupdf.Rect(t["bbox"]) | r
+        t["_numbered"] = True
+        drop.append(n)
+    for n in drop:
+        blocks.remove(n)
+    numbered = [b for b in blocks if b.get("_numbered")]
+    if len(numbered) >= 3:
+        for b in numbered:
+            if b["kind"] == "footnote":
+                b["kind"] = "note"
+    for b in numbered:
+        b.pop("_numbered", None)
+
+
 def _unheader_column_tops(blocks: list[dict], body: float) -> None:
     """위 여백이 좁은 PDF에서 '머리글 구역'에 들어온 본문 첫 줄을 되돌린다.
     - 바로 아래(6pt 이내) 본문 블록과 글자 크기가 같은 줄 = 그 단의 첫 줄(앞 쪽에서 이어지는 참고문헌 등)
@@ -1563,6 +1593,7 @@ def extract_page(page: pymupdf.Page, _in_rotated: bool = False) -> dict[str, Any
                        "text": plain, "lines": lines, "centered": centered,
                        "title": kind == "heading" and size > body * 1.3})
 
+    _attach_item_numbers(blocks, body)
     _unheader_column_tops(blocks, body)
     _absorb_fragments(blocks)
     numeric_blocks_to_figures(blocks)
@@ -2429,7 +2460,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-11-02a"
+EXTRACT_VERSION = "2026-11-04a"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
