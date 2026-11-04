@@ -151,7 +151,7 @@ def render_library() -> None:
                     stem = Path(m.get("filename", pid)).stem[:60]
                     suffix = "_번역" if name == "translation.pdf" else ""
                     col.download_button(f"{label} 저장", st.session_state[key],
-                                        file_name=f"{stem}{suffix}.pdf", mime=mime, key=f"{key}_btn")
+                                        file_name=f"{stem}{suffix}.pdf", mime=mime, key=f"{key}_btn", on_click="ignore")
                 elif col.button(f"{label} 불러오기", key=f"{key}_get"):
                     try:
                         data = lib.get_file(pid, name)
@@ -646,7 +646,7 @@ with st.expander("이전 진행 상황 불러오기 / 저장하기"):
         except Exception as e:
             st.error(f"진행 파일을 읽지 못했습니다: {e}")
     st.download_button("현재 진행 파일 받기", json.dumps({"_key": cache_key, **cache}, ensure_ascii=False),
-                       file_name=f"{cache_key}.json", mime="application/json")
+                       file_name=f"{cache_key}.json", mime="application/json", on_click="ignore")
 
 # ─────────────────────────── 번역 실행 ───────────────────────────
 def make_engine() -> engines.Engine:
@@ -948,11 +948,11 @@ if translated_count:
     stem = f"{Path(uploaded.name).stem[:60]}_번역_p{start}-{end}"
     d1, d2, d3, d4 = st.columns(4)
     d1.download_button("📕 번역 PDF", files["pdf"], file_name=f"{stem}.pdf", mime="application/pdf",
-                       type="primary")
-    d2.download_button("TXT", files["txt"], file_name=f"{stem}.txt", mime="text/plain")
-    d3.download_button("Markdown", files["md"], file_name=f"{stem}.md", mime="text/markdown")
+                       type="primary", on_click="ignore")
+    d2.download_button("TXT", files["txt"], file_name=f"{stem}.txt", mime="text/plain", on_click="ignore")
+    d3.download_button("Markdown", files["md"], file_name=f"{stem}.md", mime="text/markdown", on_click="ignore")
     d4.download_button("구조·번역 데이터", files["json"], file_name=f"{stem}_구조.json",
-                       mime="application/json", help="쪽별 블록(식별자·위치·원문·번역·검토 기록). 다시 작업할 때 씁니다.")
+                       mime="application/json", help="쪽별 블록(식별자·위치·원문·번역·검토 기록). 다시 작업할 때 씁니다.", on_click="ignore")
     review_rows = [(int(k), r) for k, v in cache.items() if k.isdigit() and isinstance(v, dict)
                    for r in v.get("review", []) if start <= int(k) <= end]
     review_rows += [(k, r) for k, v in (st.session_state.get("boundary_reviews") or {}).items()
