@@ -68,12 +68,17 @@ def secret(name: str) -> str:
 # DEEPL_API_KEY / OPENAI_API_KEY를 Secrets에 넣는 경우에는 꼭 설정할 것 (안 그러면 남이 내 한도를 쓴다).
 if secret("APP_PASSWORD") and not st.session_state.get("authed"):
     st.title("📄 논문 번역기")
-    pw = st.text_input("비밀번호", type="password")
-    if pw and pw == secret("APP_PASSWORD"):
-        st.session_state.authed = True
-        st.rerun()
-    elif pw:
-        st.error("비밀번호가 다릅니다.")
+    # 입력 뒤 Enter를 누르지 않아도 되도록 '들어가기' 버튼을 둔다 (휴대폰 키보드에서 Enter가 안 먹는 경우)
+    with st.form("login"):
+        pw = st.text_input("비밀번호", type="password")
+        go = st.form_submit_button("들어가기", type="primary")
+    st.caption("글자가 안 쳐지면 한/영 키로 영문 입력으로 바꿔 보세요. 비밀번호 칸에서는 한글을 칠 수 없습니다.")
+    if go or pw:
+        if pw.strip() == secret("APP_PASSWORD").strip():
+            st.session_state.authed = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 다릅니다.")
     st.stop()
 
 
