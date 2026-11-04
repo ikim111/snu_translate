@@ -19,15 +19,26 @@ with sync_playwright() as p:
         page.wait_for_timeout(90_000)
     else:
         print("깨어 있음")
-    # 앱 화면(iframe 안의 '논문 번역기' 제목)이 보이는지 확인
+    # 앱 화면(iframe 안의 '논문 번역기' 제목 또는 비밀번호 칸)이 뜰 때까지 최대 2분 기다린다
     ok = False
-    for frame in page.frames:
-        try:
-            if frame.get_by_text("논문 번역기").count():
+    for _ in range(24):
+        for frame in page.frames:
+            try:
+                body = frame.inner_text("body", timeout=2_000)
+            except Exception:
+                continue
+            if "논문 번역기" in body or "비밀번호" in body:
                 ok = True
                 break
-        except Exception:
-            pass
+        if ok:
+            break
+        page.wait_for_timeout(5_000)
+    if not ok:
+        print("frames:", [f.url for f in page.frames])
+        try:
+            print("본문 앞부분:", page.inner_text("body", timeout=2_000)[:300])
+        except Exception as e:
+            print("본문 읽기 실패:", e)
     print("앱 화면 확인:", "됨" if ok else "안 됨")
     browser.close()
     sys.exit(0 if ok else 1)
