@@ -1,0 +1,16 @@
+name: 번역 사이트 깨워 두기
+on:
+  schedule:
+    - cron: "17 */6 * * *"      # 6시간마다 (UTC 기준, 매시 17분)
+  workflow_dispatch: {}          # Actions 탭에서 직접 돌리기
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright==1.48.0 && python -m playwright install --with-deps chromium
+      - run: python scripts/keep_awake.py
