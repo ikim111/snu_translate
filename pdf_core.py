@@ -2460,7 +2460,7 @@ def _carry_across_columns(blocks: list[dict], page_rect: pymupdf.Rect) -> None:
 
 
 # 원문 읽기 방식의 버전. 추출 규칙을 바꾸면 올린다 → 예전에 저장한 읽기 결과는 쓰지 않고 다시 읽는다.
-EXTRACT_VERSION = "2026-11-04a"
+EXTRACT_VERSION = "2026-11-13a"
 
 
 def _extract_one(doc: pymupdf.Document, i: int) -> dict:
@@ -2575,8 +2575,29 @@ def extract_document(doc: pymupdf.Document, progress=None, workers: int | None =
     _assign_printed_numbers(pages)
     mark_references(pages)
     # 쪽 경계에서 끊긴 문장은 옮기지 않는다: 번역본 n쪽 = 원문 n쪽 내용 (원문 대조가 우선)
+    _mark_page_continuations(pages)
     _repeat_table_headers(pages)
     return pages
+
+
+def _mark_page_continuations(pages: list[dict]) -> None:
+    """앞쪽 마지막 본문 문단이 문장 중간에서 끊겨 이 쪽 첫 문단으로 이어지면, 이 쪽 첫 문단은 들여 쓰지 않는다.
+    (들여 쓰면 이어지는 문장이 새 문단처럼 보여 줄이 부자연스럽게 바뀐 것처럼 읽힌다.)"""
+    skip = ("header", "footnote", "meta")
+    for prev, pg in zip(pages, pages[1:]):
+        a = [b for b in prev.get("blocks", []) if b["kind"] == "para" and b.get("text", "").strip()
+             and not b.get("html", "").lstrip().startswith("<sup>")]          # 문단처럼 잡힌 각주는 빼고
+        rest = [b for b in pg.get("blocks", []) if b["kind"] not in skip and b.get("text", "").strip()]
+        first = next((b for b in rest if b["kind"] == "para"), None)
+        if not a or first is None or any(b["kind"] == "heading" for b in rest[:rest.index(first)]):
+            continue
+        tail = a[-1]["text"].rstrip()
+        if re.search(r"[.!?:;\"”’)\]]$", tail):
+            continue
+        xs = [ln.get("x0") for ln in (first.get("lines") or []) if isinstance(ln, dict) and ln.get("x0") is not None]
+        if len(xs) >= 2 and xs[0] > min(xs[1:]) + 1.5:     # 원문도 첫 줄을 들여 썼으면 새 문단
+            continue
+        first["no_indent"] = True
 
 
 def _repeat_table_headers(pages: list[dict]) -> None:
